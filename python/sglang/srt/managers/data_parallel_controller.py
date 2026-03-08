@@ -564,8 +564,12 @@ class DataParallelController:
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
+            logger.debug("[DP_ROUTE] rid=%s routed_to=%s", req.rid, req.routed_dp_rank)
             self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
+        logger.debug(
+            "[DP_ROUTE] rid=%s dp_rank_field=None (round-robin fallback)", req.rid
+        )
         return False
 
     def round_robin_scheduler(self, req: Req):
