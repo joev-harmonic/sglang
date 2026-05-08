@@ -94,6 +94,11 @@ class OpenAIServingBase(ABC):
                 request, raw_request
             )
 
+            if isinstance(adapted_request, GenerateReqInput):
+                adapted_request.cache_session_id = raw_request.headers.get(
+                    "x-cache-session-id"
+                )
+
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time

@@ -1012,6 +1012,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Extra cache key for caller-defined request classification.
     extra_key: Optional[str] = None
 
+    # Per-agent mamba state ID. Causes prior cached states with the same
+    # cache_session_id to be evicted before this request's state is inserted.
+    cache_session_id: Optional[str] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 

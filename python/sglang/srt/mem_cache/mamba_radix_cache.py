@@ -98,6 +98,7 @@ class TreeNode:
         self.mamba_last_access_time = self.last_access_time
 
         self.hit_count = 0
+        self.cache_session_id: Optional[str] = None
         self.host_ref_counter = 0
         self.host_mamba_ref_counter = 0
         # store the host indices of KV cache
@@ -497,6 +498,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
+        # Track nodes by cache_session_id for per-agent mamba state management
+        self._cache_session_id_to_nodes: dict[str, set[TreeNode]] = defaultdict(set)
         self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
@@ -535,10 +538,20 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba_value = params.mamba_value
         prev_prefix_len = params.prev_prefix_len
 
+        # Evict old mamba states for this agent before inserting the new one
+        if params.cache_session_id is not None:
+            self._evict_by_cache_session_id(params.cache_session_id)
+
         if value is None:
             value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
+            self.root_node,
+            key,
+            value,
+            mamba_value,
+            params.chunked,
+            prev_prefix_len,
+            cache_session_id=params.cache_session_id,
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
@@ -639,6 +652,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
                     prev_prefix_len=req.cache_protected_len,
+                    cache_session_id=req.cache_session_id,
                 )
             )
             mamba_exist = result.mamba_exist
@@ -712,6 +726,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
+        # Evict old mamba states for this agent before allocating, so the
+        # request preferentially reclaims its own prior state.
+        if req.cache_session_id is not None:
+            self._evict_by_cache_session_id(req.cache_session_id)
+
         # Donate the mamba index to the radix cache instead of copying.
         # This avoids a data copy that would race with the forward stream.
         if self.int8_ckpt_pool is not None:
@@ -754,6 +773,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mamba_value=mamba_value_donated,
                 prev_prefix_len=req.cache_protected_len,
                 chunked=chunked,
+                cache_session_id=req.cache_session_id,
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
@@ -1006,6 +1026,65 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # protected size refers to the size of the mamba cache that is locked
         return self.mamba_protected_size_
 
+    def _track_cache_session(self, node: TreeNode) -> None:
+        """Track a node's mamba state by its cache_session_id."""
+        if node.cache_session_id is not None:
+            self._cache_session_id_to_nodes[node.cache_session_id].add(node)
+            logger.debug(
+                "Cache session tracked: node_id=%d, cache_session_id=%s, "
+                "total_nodes_for_id=%d",
+                node.id,
+                node.cache_session_id,
+                len(self._cache_session_id_to_nodes[node.cache_session_id]),
+            )
+
+    def _untrack_cache_session(self, node: TreeNode) -> None:
+        """Untrack a node's mamba state by its cache_session_id."""
+        if node.cache_session_id is not None:
+            nodes = self._cache_session_id_to_nodes.get(node.cache_session_id)
+            if nodes:
+                nodes.discard(node)
+                if not nodes:
+                    del self._cache_session_id_to_nodes[node.cache_session_id]
+            node.cache_session_id = None
+
+    def _evict_by_cache_session_id(self, cache_session_id: str) -> int:
+        """Evict all unlocked mamba states with the given session ID.
+
+        For internal nodes (with children), tombstones the mamba value.
+        For leaf nodes (no children), fully evicts the node.
+        Returns the number of mamba states evicted.
+        """
+        nodes = self._cache_session_id_to_nodes.get(cache_session_id)
+        if not nodes:
+            return 0
+
+        logger.debug(
+            "Evicting cached states for cache_session_id=%s, num_existing_nodes=%d",
+            cache_session_id,
+            len(nodes),
+        )
+
+        mamba_num_evicted = 0
+        for node in list(nodes):  # copy since eviction modifies the set
+            if node.mamba_value is None or node.mamba_lock_ref > 0:
+                continue
+
+            if len(node.children) > 0:
+                # Internal node: tombstone the mamba value
+                self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+                mamba_num_evicted += len(node.mamba_value)
+                self.mamba_lru_list.remove_node(node)
+                self._tombstone_internal_node(node)
+            else:
+                # Leaf node: full evict (can't have tombstone leaves)
+                if node.full_lock_ref > 0:
+                    continue
+                _, mamba_evicted, _, _ = self._evict_leaf_node(node, True)
+                mamba_num_evicted += mamba_evicted
+
+        return mamba_num_evicted
+
     def all_values_flatten(self) -> torch.Tensor:
         values = []
 
@@ -1248,6 +1327,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
+        cache_session_id: Optional[str] = None,
     ) -> Tuple[int, bool]:
         # Refresh the full LRU from root to leaf (the whole path is reused as prefix).
         # The mamba states of these existing nodes were not recomputed this insert, so
@@ -1296,18 +1376,22 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_node.key = key
             new_node.value = value.clone()
             new_node.mamba_value = mamba_value
+            new_node.cache_session_id = cache_session_id
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
             self._record_store_event(new_node)
+            self._track_cache_session(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
+            node.cache_session_id = cache_session_id
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
+            self._track_cache_session(node)
         else:  # mamba value already exists
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
@@ -1350,10 +1434,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.full_evictable_size_ -= len(node.key)
         self.mamba_evictable_size_ -= len(node.mamba_value)
+        self._untrack_cache_session(node)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         self.mamba_evictable_size_ -= len(node.mamba_value)
+        self._untrack_cache_session(node)
         node.mamba_value = None
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
