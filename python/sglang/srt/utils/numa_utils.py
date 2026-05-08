@@ -28,7 +28,9 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
     if envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
-            numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
+            # Prefer GPU-local memory, but allow fallback to other NUMA nodes if the
+            # preferred node fills up.
+            numactl_args = f"--cpunodebind={numa_node} --preferred={numa_node}"
             executable, debug_str = _create_numactl_executable(
                 numactl_args=numactl_args
             )
