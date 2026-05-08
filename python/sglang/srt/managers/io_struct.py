@@ -779,6 +779,10 @@ class TokenizedGenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
 
+    # Per-agent mamba state ID. Causes prior cached states with the same
+    # cache_session_id to be evicted before this request's state is inserted.
+    cache_session_id: Optional[str] = None
+
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 

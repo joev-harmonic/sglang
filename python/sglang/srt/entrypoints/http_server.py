@@ -705,6 +705,8 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    obj.cache_session_id = request.headers.get("x-cache-session-id")
+
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

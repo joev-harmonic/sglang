@@ -512,6 +512,7 @@ class HiMambaRadixCache(MambaRadixCache):
             self.mamba_evictable_size_ -= mamba_num
         if self.mamba_lru_list.in_list(node):
             self.mamba_lru_list.remove_node(node)
+        self._untrack_cache_session(node)
         node.mamba_value = None
         return mamba_num
 
@@ -682,6 +683,40 @@ class HiMambaRadixCache(MambaRadixCache):
                 return self._evict_regular(x)
         return self._evict_to_host(x)
 
+    def _evict_by_cache_session_id(self, cache_session_id: str) -> int:
+        """HiCache variant: route leaf eviction through _evict_device_leaf so we
+        respect host-backup / write-back semantics instead of hard-freeing KV.
+        """
+        nodes = self._cache_session_id_to_nodes.get(cache_session_id)
+        if not nodes:
+            return 0
+
+        logger.debug(
+            "Evicting cached states for cache_session_id=%s, num_existing_nodes=%d",
+            cache_session_id,
+            len(nodes),
+        )
+
+        mamba_num_evicted = 0
+        for node in list(nodes):
+            if node.mamba_value is None or node.mamba_lock_ref > 0:
+                continue
+
+            if len(node.children) > 0:
+                # Internal node: tombstone the mamba value, KV stays on device
+                mamba_num_evicted += len(node.mamba_value)
+                self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+                self.mamba_lru_list.remove_node(node)
+                self._tombstone_internal_node(node)
+            else:
+                # Leaf node: demote to host or full evict (per write policy)
+                if node.full_lock_ref > 0:
+                    continue
+                _, mamba_evicted = self._evict_device_leaf(node)
+                mamba_num_evicted += mamba_evicted
+
+        return mamba_num_evicted
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -835,6 +870,7 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
+        cache_session_id: Optional[str] = None,
     ) -> Tuple[int, bool]:
         assert mamba_value is not None, "Mamba value should not be None here."
         node.last_access_time = get_last_access_time()
@@ -881,15 +917,19 @@ class HiMambaRadixCache(MambaRadixCache):
 
         mamba_value_exist = False
         if len(key):
-            new_node = self._add_new_node(node, key, value, mamba_value)
+            new_node = self._add_new_node(
+                node, key, value, mamba_value, cache_session_id=cache_session_id
+            )
             self._inc_hit_count(new_node, chunked)
         elif node.mamba_value is None:
             node.mamba_value = mamba_value
+            node.cache_session_id = cache_session_id
             if not node.evicted:
                 self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
+            self._track_cache_session(node)
         else:
             mamba_value_exist = True
             if not node.evicted:
@@ -905,6 +945,7 @@ class HiMambaRadixCache(MambaRadixCache):
         key: RadixKey,
         value: torch.Tensor,
         mamba_value: torch.Tensor,
+        cache_session_id: Optional[str] = None,
     ) -> TreeNode:
         child_key = key.child_key(self.page_size)
         new_node = TreeNode()
@@ -912,11 +953,13 @@ class HiMambaRadixCache(MambaRadixCache):
         new_node.key = key
         new_node.value = value.clone()
         new_node.mamba_value = mamba_value
+        new_node.cache_session_id = cache_session_id
         self.full_lru_list.insert_mru(new_node)
         self.mamba_lru_list.insert_mru(new_node)
         parent.children[child_key] = new_node
         self.full_evictable_size_ += len(value)
         self.mamba_evictable_size_ += len(mamba_value)
+        self._track_cache_session(new_node)
         if self.enable_storage or self.enable_kv_cache_events:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
         self._record_store_event(new_node, medium=StorageMedium.GPU)

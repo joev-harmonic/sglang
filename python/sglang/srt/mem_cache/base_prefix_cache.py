@@ -55,6 +55,7 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    cache_session_id: Optional[str] = None
 
     # SWA specific
     prev_prefix_len: int = 0
