@@ -66,6 +66,29 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(model_config.swa_head_dim, 64)
         self.assertEqual(model_config.swa_v_head_dim, 48)
 
+    def test_glm_nextn_uses_qk_rope_width_when_head_dim_is_missing(self):
+        text_config = _make_text_config(
+            architectures=["Glm4MoeForCausalLMNextN"],
+            qk_rope_head_dim=64,
+            head_dim=None,
+            v_head_dim=None,
+            swa_head_dim=None,
+            swa_v_head_dim=None,
+        )
+
+        model_config = self._derive_shapes(text_config)
+
+        # hidden_size / num_attention_heads is 128, so these assertions prove
+        # the GLM-specific RoPE width won over the generic fallback.
+        self.assertEqual(model_config.head_dim, 64)
+        self.assertEqual(model_config.v_head_dim, 64)
+        self.assertEqual(model_config.swa_head_dim, 64)
+        self.assertEqual(model_config.swa_v_head_dim, 64)
+        self.assertEqual(text_config.head_dim, 64)
+        self.assertEqual(text_config.v_head_dim, 64)
+        self.assertEqual(text_config.swa_head_dim, 64)
+        self.assertEqual(text_config.swa_v_head_dim, 64)
+
 
 if __name__ == "__main__":
     unittest.main()
