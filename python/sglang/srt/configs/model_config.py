@@ -855,7 +855,8 @@ class ModelConfig:
 
     def _derive_model_shapes(self):
         # Unify the config keys for hf_text_config
-        self.head_dim = getattr(self.hf_text_config, "head_dim", None)
+        configured_head_dim = getattr(self.hf_text_config, "head_dim", None)
+        self.head_dim = configured_head_dim
         if self.head_dim is None:
             self.head_dim = (
                 self.hf_text_config.hidden_size
@@ -868,7 +869,8 @@ class ModelConfig:
             self.v_head_dim = self.head_dim
             setattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
 
-        self.swa_head_dim = getattr(self.hf_text_config, "swa_head_dim", None)
+        configured_swa_head_dim = getattr(self.hf_text_config, "swa_head_dim", None)
+        self.swa_head_dim = configured_swa_head_dim
         if self.swa_head_dim is None:
             self.swa_head_dim = self.head_dim
             setattr(self.hf_text_config, "swa_head_dim", self.swa_head_dim)
@@ -927,15 +929,21 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MHA
             self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
-            if self.head_dim is None:
-                self.head_dim = (
+            if configured_head_dim is None:
+                self.head_dim = getattr(
+                    self.hf_text_config,
+                    "qk_rope_head_dim",
                     self.hf_text_config.hidden_size
-                    // self.hf_text_config.num_attention_heads
+                    // self.hf_text_config.num_attention_heads,
                 )
-            if self.swa_head_dim is None:
+            if configured_swa_head_dim is None:
                 self.swa_head_dim = self.head_dim
             self.v_head_dim = self.head_dim
             self.swa_v_head_dim = self.swa_head_dim
+            self.hf_text_config.head_dim = self.head_dim
+            self.hf_text_config.v_head_dim = self.v_head_dim
+            self.hf_text_config.swa_head_dim = self.swa_head_dim
+            self.hf_text_config.swa_v_head_dim = self.swa_v_head_dim
             self.attention_arch = AttentionArch.MHA
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
