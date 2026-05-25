@@ -406,6 +406,10 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            if self._engine_paused:
+                continue
+
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -439,6 +443,10 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            if self._engine_paused:
+                continue
+
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
