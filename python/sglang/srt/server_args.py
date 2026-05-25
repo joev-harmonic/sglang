@@ -3331,11 +3331,6 @@ class ServerArgs:
                 ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
             assert self.pp_size == 1, "PP size should be set to 1 under elastic EP"
-
-            if self.elastic_ep_backend == "mooncake":
-                self.mooncake_ib_device = self._validate_ib_devices(
-                    self.mooncake_ib_device
-                )
         if self.elastic_ep_rejoin:
             assert (
                 self.elastic_ep_backend is not None
@@ -4128,15 +4123,6 @@ class ServerArgs:
                 "requires at least one encoder urls to be set via --encoder-urls"
             )
 
-        # Validate IB devices when mooncake backend is used
-        if (
-            self.disaggregation_transfer_backend == "mooncake"
-            and self.disaggregation_mode in ("prefill", "decode")
-        ) or self.encoder_transfer_backend == "mooncake":
-            self.disaggregation_ib_device = self._validate_ib_devices(
-                self.disaggregation_ib_device
-            )
-
         # Validate model type: only support Qwen models for now
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
@@ -4157,59 +4143,6 @@ class ServerArgs:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
             )
-
-    def _validate_ib_devices(self, device_str: str) -> Optional[str]:
-        """
-        Validate IB devices before passing to mooncake.
-
-        Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
-
-        Returns:
-            Normalized comma-separated string of validated device names, or None if input is None.
-        """
-        if device_str is None:
-            logger.warning(
-                "No IB devices specified for Mooncake backend, falling back to auto discovery."
-            )
-            return None
-
-        # Strip whitespace from device names
-        devices = [d.strip() for d in device_str.split(",") if d.strip()]
-        if len(devices) == 0:
-            raise ValueError("No valid IB devices specified")
-
-        # Deduplicate while preserving order
-        unique_devices = list(dict.fromkeys(devices))
-        if len(unique_devices) != len(devices):
-            logger.warning(
-                "Duplicate IB devices specified: %s. Deduplicating to: %s",
-                device_str,
-                ",".join(unique_devices),
-            )
-            devices = unique_devices
-
-        # Get available IB devices from sysfs
-        ib_sysfs_path = "/sys/class/infiniband"
-        if not os.path.isdir(ib_sysfs_path):
-            raise RuntimeError(
-                f"InfiniBand sysfs path not found: {ib_sysfs_path}. "
-                "Please ensure InfiniBand drivers are installed."
-            )
-
-        available_devices = set(os.listdir(ib_sysfs_path))
-        if len(available_devices) == 0:
-            raise RuntimeError(f"No IB devices found in {ib_sysfs_path}")
-
-        # Check for invalid devices
-        invalid_devices = [d for d in devices if d not in available_devices]
-        if len(invalid_devices) != 0:
-            raise ValueError(
-                f"Invalid IB devices specified: {invalid_devices}. "
-                f"Available devices: {sorted(available_devices)}"
-            )
-
-        return ",".join(devices)
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
@@ -6169,8 +6102,10 @@ class ServerArgs:
             "--mooncake-ib-device",
             type=str,
             default=ServerArgs.mooncake_ib_device,
-            help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
-            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
+            help="The InfiniBand devices for Mooncake Backend transfer. Accepts: "
+            "comma-separated devices (e.g., mlx5_0,mlx5_1), "
+            'a JSON GPU mapping (e.g., \'{"0":"mlx5_0,mlx5_1","1":"mlx5_2,mlx5_3"}\'), '
+            "or a path to a JSON file containing the mapping. "
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
         parser.add_argument(
@@ -6944,8 +6879,10 @@ class ServerArgs:
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+            help="The InfiniBand devices for disaggregation transfer. Accepts: "
+            "comma-separated devices (e.g., mlx5_0,mlx5_1), "
+            'a JSON GPU mapping (e.g., \'{"0":"mlx5_0,mlx5_1","1":"mlx5_2,mlx5_3"}\'), '
+            "or a path to a JSON file containing the mapping. "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
