@@ -588,6 +588,7 @@ class Req(ReqDllmMixin):
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
+        return_sampling_mask: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_id: Optional[str] = None,
@@ -772,6 +773,7 @@ class Req(ReqDllmMixin):
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
+        self.send_output_sampling_mask_offset: int = 0
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
@@ -781,6 +783,7 @@ class Req(ReqDllmMixin):
         self.token_ids_logprob = token_ids_logprob
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
+        self.return_sampling_mask = return_sampling_mask
 
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
@@ -816,6 +819,12 @@ class Req(ReqDllmMixin):
             ) = self.output_top_logprobs_idx = self.output_token_ids_logprobs_val = (
                 self.output_token_ids_logprobs_idx
             ) = None
+        if return_sampling_mask:
+            self.output_token_sampling_mask = []
+            self.output_token_sampling_logprobs = []
+        else:
+            self.output_token_sampling_mask = None
+            self.output_token_sampling_logprobs = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None

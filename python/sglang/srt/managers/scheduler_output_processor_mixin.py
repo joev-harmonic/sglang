@@ -285,6 +285,8 @@ class SchedulerOutputProcessorMixin:
                                 logits_output,
                             )
                         logprob_pt += num_input_logprobs
+                    if req.return_sampling_mask:
+                        self.add_sampling_mask_return_values(i, req, logits_output)
 
                     if (
                         req.return_hidden_states
@@ -599,6 +601,12 @@ class SchedulerOutputProcessorMixin:
                         req.output_token_ids_logprobs_idx.append(
                             logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                         )
+
+            if req.return_sampling_mask:
+                # return_sampling_mask + speculative decoding is rejected at
+                # request entry (Scheduler.handle_generate_request), so here we
+                # only ever see normal decode with one support mask per token.
+                self.add_sampling_mask_return_values(i, req, logits_output)
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
@@ -976,6 +984,20 @@ class SchedulerOutputProcessorMixin:
 
         return num_input_logprobs
 
+    def add_sampling_mask_return_values(
+        self: Scheduler,
+        i: int,
+        req: Req,
+        output: LogitsProcessorOutput,
+    ) -> None:
+        """Attach sparse sampling support metadata to the return values."""
+        mask = output.next_token_sampling_mask_idx
+        logprobs = output.next_token_sampling_logprobs
+        req.output_token_sampling_mask.append(None if mask is None else mask[i])
+        req.output_token_sampling_logprobs.append(
+            None if logprobs is None else logprobs[i]
+        )
+
     def _initialize_empty_logprob_containers(self: Scheduler, req: Req) -> None:
         """
         Initialize logprob fields to empty lists if unset.
@@ -1059,6 +1081,7 @@ class SchedulerOutputProcessorMixin:
         customized_info = {}
 
         time_stats = []
+        return_sampling_mask = any(req.return_sampling_mask for req in reqs)
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -1083,6 +1106,12 @@ class SchedulerOutputProcessorMixin:
             ) = input_token_ids_logprobs_idx = output_token_ids_logprobs_val = (
                 output_token_ids_logprobs_idx
             ) = None
+
+        if return_sampling_mask:
+            output_token_sampling_mask = []
+            output_token_sampling_logprobs = []
+        else:
+            output_token_sampling_mask = output_token_sampling_logprobs = None
 
         for req in reqs:
             if req is skip_req:
@@ -1123,6 +1152,7 @@ class SchedulerOutputProcessorMixin:
                 send_output_token_logprobs_offset = (
                     req.send_output_token_logprobs_offset
                 )
+                send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(
@@ -1233,6 +1263,24 @@ class SchedulerOutputProcessorMixin:
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
 
+                if return_sampling_mask:
+                    if req.return_sampling_mask:
+                        sampling_mask_end = len(req.output_token_sampling_mask)
+                        output_token_sampling_mask.append(
+                            req.output_token_sampling_mask[
+                                send_output_sampling_mask_offset:sampling_mask_end
+                            ]
+                        )
+                        output_token_sampling_logprobs.append(
+                            req.output_token_sampling_logprobs[
+                                send_output_sampling_mask_offset:sampling_mask_end
+                            ]
+                        )
+                        req.send_output_sampling_mask_offset = sampling_mask_end
+                    else:
+                        output_token_sampling_mask.append([])
+                        output_token_sampling_logprobs.append([])
+
                 if req.return_hidden_states:
                     if output_hidden_states is None:
                         output_hidden_states = []
@@ -1308,6 +1356,8 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_val=output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
+                    output_token_sampling_mask=output_token_sampling_mask,
+                    output_token_sampling_logprobs=output_token_sampling_logprobs,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
                     indexer_topk=indexer_topk,

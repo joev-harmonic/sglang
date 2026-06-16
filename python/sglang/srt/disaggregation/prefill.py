@@ -528,6 +528,18 @@ class SchedulerDisaggregationPrefillMixin:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
+            if logits_output.next_token_top_logprobs_val:
+                logits_output.next_token_top_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                ]
+            if logits_output.next_token_token_ids_logprobs_val:
+                logits_output.next_token_token_ids_logprobs_val = [
+                    v.tolist()
+                    for v in logits_output.next_token_token_ids_logprobs_val
+                ]
 
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
@@ -562,6 +574,8 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
+                if req.return_sampling_mask:
+                    self.add_sampling_mask_return_values(i, req, logits_output)
                 self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
