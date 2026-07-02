@@ -24,6 +24,22 @@ class HybridAttnBackend(AttentionBackend):
         self.decode_backend = decode_backend
         self.data_type = model_runner.kv_cache_dtype
 
+    def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
+        if self.model_runner.server_args.speculative_attention_mode == "decode":
+            backends = (self.decode_backend, self.prefill_backend)
+        else:
+            backends = (self.prefill_backend, self.decode_backend)
+
+        for backend in backends:
+            method = getattr(backend, "update_mamba_state_after_mtp_verify", None)
+            if method is not None:
+                return method(*args, **kwargs)
+
+        raise AttributeError(
+            "neither wrapped attention backend implements "
+            "update_mamba_state_after_mtp_verify"
+        )
+
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
         Select the appropriate attention backend based on the forward mode.
