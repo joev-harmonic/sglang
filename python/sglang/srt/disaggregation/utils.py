@@ -147,8 +147,8 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
-        max_sampling_mask_tokens: int = int(
-            os.getenv("SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS", "0")
+        max_sampling_mask_tokens: int = (
+            envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.get()
         ),
         custom_mem_pool: torch.cuda.MemPool = None,
     ):

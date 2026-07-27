@@ -272,9 +272,15 @@ class Sampler(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return sorted token ids, sorted probs, keep mask, and raw probs."""
         vocab_size = probs.shape[-1]
-        max_top_k = int(sampling_info.top_ks.max().item())
+        max_top_k = sampling_info.sampling_mask_max_top_k
         if 0 < max_top_k < vocab_size:
-            probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1)
+            probs_sort, probs_idx = torch.topk(
+                probs,
+                k=max_top_k,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            )
             positions = torch.arange(max_top_k, device=probs.device).view(1, -1)
         else:
             probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
@@ -301,7 +307,7 @@ class Sampler(nn.Module):
         logprobs = []
         for i, should_return in enumerate(sampling_info.return_sampling_masks or []):
             if should_return:
-                masks.append([tokens[i]])
+                masks.append([int(tokens[i])])
                 logprobs.append(0.0)
             else:
                 masks.append(None)
@@ -317,9 +323,11 @@ class Sampler(nn.Module):
         sampling_mask_data: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> None:
         probs_idx, probs_sort, keep_mask, probs = sampling_mask_data
-        # The caller only invokes this when at least one request opted in, so
-        # return_sampling_masks is always non-empty here.
-        return_sampling_masks = sampling_info.return_sampling_masks
+        return_sampling_masks = sampling_info.return_sampling_masks or []
+        if not return_sampling_masks:
+            logits_output.next_token_sampling_mask_idx = []
+            logits_output.next_token_sampling_logprobs = []
+            return
 
         sampled_tokens = batch_next_token_ids.view(-1, 1)
         sampled_matches_all = probs_idx == sampled_tokens
