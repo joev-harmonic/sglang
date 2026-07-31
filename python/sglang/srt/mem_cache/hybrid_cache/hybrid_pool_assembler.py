@@ -693,11 +693,14 @@ def build_hybrid_mamba_stack(
     mtp_draft_device_pools = tuple(
         pool.full_kv_pool for pool in params.mtp_draft_device_pools
     )
+    enable_mamba_hicache = not server_args.hicache_disable_mamba
     kv_host_size, mamba_host_size = None, 0
     if server_args.hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            server_args.hicache_size, (kv_pool, mamba_pool)
-        )
+        split_pools = (kv_pool, mamba_pool) if enable_mamba_hicache else (kv_pool,)
+        split_sizes = _split_hicache_size(server_args.hicache_size, split_pools)
+        kv_host_size = split_sizes[0]
+        if enable_mamba_hicache:
+            mamba_host_size = split_sizes[1]
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -713,13 +716,6 @@ def build_hybrid_mamba_stack(
             target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(server_args),
-        layout=server_args.hicache_mem_layout,
-    )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -729,18 +725,28 @@ def build_hybrid_mamba_stack(
             transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
             is_anchor=True,
         ),
-        build_pool_entry(
-            name=PoolName.MAMBA,
-            host_pool=mamba_host_pool,
-            device_pool=mamba_pool,
-            layer_mapping=mamba_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
-            host_evict_fn=host_mamba_evict_fn,
-            device_evict_fn=device_mamba_evict_fn,
-            device_alloc_fn=mamba_allocator.alloc,
-            device_free_fn=mamba_allocator.free,
-        ),
     ]
+    if enable_mamba_hicache:
+        mamba_host_pool = MambaPoolHost(
+            mamba_pool,
+            get_memory().hicache_ratio,
+            mamba_host_size,
+            allocator_type=_get_allocator_type(server_args),
+            layout=server_args.hicache_mem_layout,
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.MAMBA,
+                host_pool=mamba_host_pool,
+                device_pool=mamba_pool,
+                layer_mapping=mamba_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+                host_evict_fn=host_mamba_evict_fn,
+                device_evict_fn=device_mamba_evict_fn,
+                device_alloc_fn=mamba_allocator.alloc,
+                device_free_fn=mamba_allocator.free,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -797,10 +803,17 @@ def build_hybrid_mamba_swa_stack(
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
+    enable_mamba_hicache = not server_args.hicache_disable_mamba
     if server_args.hicache_size > 0:
-        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            server_args.hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+        split_pools = (
+            (full_kv_pool, swa_kv_pool, mamba_pool)
+            if enable_mamba_hicache
+            else (full_kv_pool, swa_kv_pool)
         )
+        split_sizes = _split_hicache_size(server_args.hicache_size, split_pools)
+        kv_host_size, swa_host_size = split_sizes[:2]
+        if enable_mamba_hicache:
+            mamba_host_size = split_sizes[2]
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
@@ -816,13 +829,6 @@ def build_hybrid_mamba_swa_stack(
         use_mla=False,
         host_size=swa_host_size,
         pool_label="swa",
-    )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=server_args.hicache_storage_backend,
-        layout=server_args.hicache_mem_layout,
     )
     entries = [
         build_pool_entry(
@@ -844,18 +850,28 @@ def build_hybrid_mamba_swa_stack(
             device_alloc_fn=swa_attn_allocator.alloc,
             device_free_fn=swa_attn_allocator.free,
         ),
-        build_pool_entry(
-            name=PoolName.MAMBA,
-            host_pool=mamba_host_pool,
-            device_pool=mamba_pool,
-            layer_mapping=mamba_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
-            host_evict_fn=host_mamba_evict_fn,
-            device_evict_fn=device_mamba_evict_fn,
-            device_alloc_fn=mamba_allocator.alloc,
-            device_free_fn=mamba_allocator.free,
-        ),
     ]
+    if enable_mamba_hicache:
+        mamba_host_pool = MambaPoolHost(
+            mamba_pool,
+            get_memory().hicache_ratio,
+            mamba_host_size,
+            allocator_type=_get_allocator_type(server_args),
+            layout=server_args.hicache_mem_layout,
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.MAMBA,
+                host_pool=mamba_host_pool,
+                device_pool=mamba_pool,
+                layer_mapping=mamba_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+                host_evict_fn=host_mamba_evict_fn,
+                device_evict_fn=device_mamba_evict_fn,
+                device_alloc_fn=mamba_allocator.alloc,
+                device_free_fn=mamba_allocator.free,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1301,16 +1317,20 @@ class _MambaStrategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        component_host_pools = {
+            ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+        }
+        if not server_args.hicache_disable_mamba:
+            component_host_pools[ComponentType.MAMBA] = host_pool_group.get_pool(
+                PoolName.MAMBA
+            )
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
-            component_host_pools={
-                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
-                ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
-            },
+            component_host_pools=component_host_pools,
             register_req_to_token_counter=True,
             transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
-            pools_desc="KV + MAMBA",
+            pools_desc=("KV" if server_args.hicache_disable_mamba else "KV + MAMBA"),
         )
 
 
@@ -1440,19 +1460,25 @@ class _MambaSwaStrategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        component_host_pools = {
+            ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+            ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
+        }
+        if not server_args.hicache_disable_mamba:
+            component_host_pools[ComponentType.MAMBA] = host_pool_group.get_pool(
+                PoolName.MAMBA
+            )
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
-            component_host_pools={
-                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
-                ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
-                ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
-            },
+            component_host_pools=component_host_pools,
             register_req_to_token_counter=True,
             transfer_layer_num=len(
                 full_layer_mapping | swa_layer_mapping | mamba_layer_mapping
             ),
-            pools_desc="KV + SWA + MAMBA",
+            pools_desc=(
+                "KV + SWA" if server_args.hicache_disable_mamba else "KV + SWA + MAMBA"
+            ),
         )
 
 

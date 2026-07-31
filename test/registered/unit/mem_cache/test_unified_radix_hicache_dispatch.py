@@ -18,6 +18,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     register_stack_strategy,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+    MambaComponent,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -57,6 +60,50 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         kvcache = _mock_kvcache(HybridLinearKVPool)
         strategy = _select_strategy(kvcache, {FULL, MAMBA})
         self.assertIsInstance(strategy, _MambaStrategy)
+
+    def test_mamba_strategy_can_disable_host_state_pool(self):
+        strategy = _MambaStrategy()
+        host_pool_group = MagicMock()
+        full_host_pool = object()
+        host_pool_group.get_pool.return_value = full_host_pool
+        cache_controller = MagicMock()
+        cache = MagicMock(page_size=1)
+        kvcache = MagicMock()
+        kvcache.full_attention_layer_id_mapping = {0: 0}
+        kvcache.full_kv_pool = object()
+        kvcache.use_mla = False
+        params = MagicMock()
+        params.req_to_token_pool.mamba_map = {1: 0}
+        params.req_to_token_pool.mamba_pool = object()
+        params.tp_cache_group = None
+        params.pp_cache_group = None
+        server_args = MagicMock(hicache_disable_mamba=True)
+
+        with patch.object(
+            hybrid_pool_assembler,
+            "build_hybrid_mamba_stack",
+            return_value=(host_pool_group, cache_controller),
+        ):
+            result = strategy.build(
+                cache=cache,
+                kvcache=kvcache,
+                params=params,
+                server_args=server_args,
+                load_cache_event=object(),
+            )
+
+        self.assertEqual(result.component_host_pools, {FULL: full_host_pool})
+        self.assertEqual(result.pools_desc, "KV")
+
+    def test_mamba_device_state_survives_kv_only_hicache_demotion(self):
+        component = object.__new__(MambaComponent)
+        component.cache = MagicMock(cache_controller=object())
+        component._mamba_pool_host = None
+        self.assertEqual(component.eviction_priority(is_leaf=True), 1)
+        self.assertEqual(component.eviction_priority(is_leaf=False), 0)
+
+        component._mamba_pool_host = object()
+        self.assertEqual(component.eviction_priority(is_leaf=True), 0)
 
     def test_swa(self):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool

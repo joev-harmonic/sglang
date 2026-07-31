@@ -2677,6 +2677,12 @@ class ServerArgs:
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache", NS("memory")] = (
         False
     )
+    hicache_disable_mamba: A[
+        bool,
+        "Disable hierarchical-cache offloading for Mamba states while keeping "
+        "KV HiCache enabled.",
+        NS("memory"),
+    ] = False
     hicache_ratio: A[
         Optional[float],
         "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0, or 1.0 for host-pool decode retraction.",
@@ -7423,6 +7429,10 @@ class ServerArgs:
                 and self.disaggregation_decode_retraction_backup in (None, "host_pool")
             )
         ):
+            if self.hicache_disable_mamba:
+                logger.warning(
+                    "--hicache-disable-mamba has no effect unless hierarchical cache is enabled."
+                )
             return
 
         # Step 1: Initial layout-io compatibility normalization.
