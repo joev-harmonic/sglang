@@ -1802,6 +1802,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.model.config.num_hidden_layers
+            layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+        self.model.set_dflash_layers_to_capture(
+            [layer_id + 1 for layer_id in layer_ids]
+        )
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
@@ -1969,6 +1980,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.model.config.num_hidden_layers
+            layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+        self.model.set_dflash_layers_to_capture(
+            [layer_id + 1 for layer_id in layer_ids]
+        )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
