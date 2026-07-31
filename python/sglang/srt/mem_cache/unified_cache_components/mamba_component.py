@@ -57,6 +57,16 @@ class MambaComponent(TreeComponent):
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
+    def eviction_priority(self, is_leaf: bool) -> int:
+        # With KV-only HiCache, a Full leaf can move to host while its Mamba
+        # checkpoint stays resident on device. Give Mamba a higher leaf priority
+        # so Full's device cascade preserves it; an explicit Mamba eviction or
+        # final host-leaf deletion still frees the checkpoint.
+        if is_leaf and self.cache.cache_controller is not None:
+            if self._mamba_pool_host is None:
+                return 1
+        return super().eviction_priority(is_leaf)
+
     def refresh_lru(
         self,
         phase: LRURefreshPhase,
@@ -484,6 +494,8 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
+            if self._mamba_pool_host is None:
+                return None
             cd = node.component_data[ct]
             if cd.value is None:
                 return None
