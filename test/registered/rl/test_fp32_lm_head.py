@@ -101,7 +101,7 @@ class TestLMHeadFP32(unittest.TestCase):
 
         def probe_linear(x, w, bias=None):
             if not state["called"]:
-                state.update(called=True, ooperationp="linear", a=x.dtype, b=w.dtype)
+                state.update(called=True, operation="linear", a=x.dtype, b=w.dtype)
             return original_linear(x, w, bias)
 
         with (
@@ -109,9 +109,9 @@ class TestLMHeadFP32(unittest.TestCase):
             patch("torch.mm", new=probe_mm),
             patch("torch.nn.functional.linear", new=probe_linear),
         ):
-            logits = logprocessor._get_logits(hidden_state, head, meta)
+            logprocessor._get_logits(hidden_state, head, meta)
         self.assertEqual(hidden_state.dtype, hidden_state_dtype)
-        self.assertTrue(state["called"], "no call lm head matlmul/linear")
+        self.assertTrue(state["called"], "no call lm head matmul/linear")
         self.assertEqual(state["operation"], expected_operation)
         self.assertEqual(state["a"], expected_a_dtype)
         self.assertEqual(state["b"], expected_b_dtype)
