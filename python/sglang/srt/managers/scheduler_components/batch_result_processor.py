@@ -1002,10 +1002,17 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         """Attach sparse sampling support metadata to the return values."""
         mask = output.next_token_sampling_mask_idx
+        mask_len = output.next_token_sampling_mask_len
         logprobs = output.next_token_sampling_logprobs
-        req.output_token_sampling_mask.append(None if mask is None else mask[i])
+        if mask is None or mask_len is None:
+            req.output_token_sampling_mask.append(None)
+        else:
+            # In overlap mode the next forward has already launched. Keep this
+            # conversion out of Sampler.forward so its transfer can be hidden.
+            length = int(mask_len[i].item())
+            req.output_token_sampling_mask.append(mask[i, :length].cpu().tolist())
         req.output_token_sampling_logprobs.append(
-            None if logprobs is None else logprobs[i]
+            None if logprobs is None else float(logprobs[i].item())
         )
 
     def _handle_finish_state_updated_req(
