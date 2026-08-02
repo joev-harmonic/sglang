@@ -101,9 +101,11 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         component._mamba_pool_host = None
         self.assertEqual(component.eviction_priority(is_leaf=True), 1)
         self.assertEqual(component.eviction_priority(is_leaf=False), 0)
+        self.assertTrue(component.can_outlive_full_device_data())
 
         component._mamba_pool_host = object()
         self.assertEqual(component.eviction_priority(is_leaf=True), 0)
+        self.assertFalse(component.can_outlive_full_device_data())
 
     def test_swa(self):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool

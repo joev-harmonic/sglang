@@ -284,6 +284,10 @@ class TreeComponent(ABC):
         - Full evict internal: cascades to SWA + Mamba."""
         return 0
 
+    def can_outlive_full_device_data(self) -> bool:
+        """Whether this component may stay on device after Full moves to host."""
+        return False
+
     @abstractmethod
     def drive_eviction(
         self, params: EvictParams, tracker: dict[ComponentType, int]

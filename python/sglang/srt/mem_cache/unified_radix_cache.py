@@ -2813,12 +2813,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             full_dev = node.component_data[FCT].value is not None
             full_hst = node.component_data[FCT].host_value is not None
 
-            # Full is the tree backbone, so aux data requires Full data.
+            # Full is the tree backbone, so aux data normally requires Full
+            # data on the same layer. KV-only HiCache is the deliberate
+            # exception: it can demote Full KV while retaining Mamba in HBM.
             for ct in self.tree_components:
                 if ct == FCT:
                     continue
                 cd = node.component_data[ct]
-                if cd.value is not None and not full_dev:
+                if (
+                    cd.value is not None
+                    and not full_dev
+                    and not self.components[ct].can_outlive_full_device_data()
+                ):
                     E(f"node {nid} {ct} device present but Full.value=None")
                 if cd.host_value is not None and not full_hst:
                     E(f"node {nid} {ct} host present but Full.host_value=None")
