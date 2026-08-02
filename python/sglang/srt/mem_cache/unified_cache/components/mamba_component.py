@@ -124,6 +124,11 @@ class MambaComponent(TreeComponent):
                 return 1
         return super().eviction_priority(is_leaf)
 
+    def can_outlive_full_device_data(self) -> bool:
+        # KV-only HiCache deliberately keeps the Mamba checkpoint in HBM when
+        # the corresponding Full KV is demoted to host memory.
+        return self.cache.cache_controller is not None and self._mamba_pool_host is None
+
     def refresh_lru(
         self,
         phase: LRURefreshPhase,

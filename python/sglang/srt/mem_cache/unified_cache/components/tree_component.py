@@ -493,6 +493,10 @@ class TreeComponent(ABC):
         - Full evict internal: cascades to SWA + Mamba."""
         return 0
 
+    def can_outlive_full_device_data(self) -> bool:
+        """Whether this component may stay on device after Full moves to host."""
+        return False
+
     def evict_device_start(self, request_cnt: int) -> None:
         """Begin this component's device-eviction walk (build its cursor/heap)."""
         assert (
@@ -521,7 +525,6 @@ class TreeComponent(ABC):
         ), f"{self.component_type} device eviction not started"
         self._evict_device_end()
         self.is_evict_device_ongoing = False
-
     @abstractmethod
     def _evict_device_start(self, request_cnt: int) -> None:
         """Build this component's eviction cursor/heap."""

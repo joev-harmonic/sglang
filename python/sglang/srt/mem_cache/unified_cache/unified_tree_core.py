@@ -2102,12 +2102,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             full_dev = node.component_data[FCT].value is not None
             full_hst = node.component_data[FCT].host_value is not None
 
-            # Full is the tree backbone, so aux data requires Full data.
+            # Full is normally the tree backbone. KV-only HiCache is the one
+            # exception: Mamba state can remain resident while Full KV lives
+            # only on host.
             for ct in self.component_types:
                 if ct == FCT:
                     continue
                 cd = node.component_data[ct]
-                if cd.value is not None and not full_dev:
+                if (
+                    cd.value is not None
+                    and not full_dev
+                    and not self.components_by_type[
+                        ct
+                    ].can_outlive_full_device_data()
+                ):
                     E(f"node {nid} {ct} device present but Full.value=None")
                 if cd.host_value is not None and not full_hst:
                     # write_back reclaim takes only the Full host layer; an
