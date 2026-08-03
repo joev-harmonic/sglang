@@ -1317,7 +1317,7 @@ class TestHiCacheArgs(unittest.TestCase):
                     expected_decode_backend=case.get("expected_decode_backend"),
                 )
 
-    def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
+    def test_hicache_kernel_uses_flashinfer_for_implicit_fa3_decode(self):
         args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_io_backend="kernel",
@@ -1325,11 +1325,13 @@ class TestHiCacheArgs(unittest.TestCase):
             decode_attention_backend=None,
         )
 
-        args._handle_hicache()
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+            args._handle_hicache()
 
         self.assertEqual(args.hicache_io_backend, "kernel")
         self.assertEqual(args.hicache_mem_layout, "page_first")
-        self.assertIsNone(args.decode_attention_backend)
+        self.assertEqual(args.decode_attention_backend, "flashinfer")
+        self.assertIn("rollout-vs-train KL by about 50x", "\n".join(logs.output))
 
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(
