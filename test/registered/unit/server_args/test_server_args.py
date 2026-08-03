@@ -1321,8 +1321,12 @@ class TestHiCacheArgs(unittest.TestCase):
         args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_io_backend="kernel",
-            attention_backend="fa3",
             decode_attention_backend=None,
+        )
+        # Default attention backends are declarations until the end of
+        # ServerArgs.__post_init__; exercise that truly implicit path here.
+        args._resolved_overrides.append(
+            ("test-implicit-attention-default", {"attention_backend": "fa3"})
         )
 
         with self.assertLogs(server_args_module.logger, level="WARNING") as logs:

@@ -7454,10 +7454,11 @@ class ServerArgs:
         # in our fixed-token parity experiment (Miles experiment 241). Preserve
         # the historical numerical behavior in the Harmonic fork. An explicit
         # decode backend always wins, so this remains user-overridable.
+        resolved = self._resolved()
         if (
             self.hicache_io_backend == "kernel"
-            and self.decode_attention_backend is None
-            and self.attention_backend == "fa3"
+            and resolved.decode_attention_backend is None
+            and resolved.attention_backend == "fa3"
         ):
             self.decode_attention_backend = "flashinfer"
             logger.warning(
