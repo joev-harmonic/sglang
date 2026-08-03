@@ -6259,6 +6259,7 @@ class ServerArgs:
         Resolution order:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
+        3) Harmonic's implicit decode-backend policy.
         """
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
@@ -6276,6 +6277,29 @@ class ServerArgs:
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
+
+        # HARMONIC POLICY: Keep the effective backend split used by the
+        # Qwen3.5-35B reference training run: FA3 prefill + FlashInfer decode.
+        # Upstream PR #21631 (commit b5bcd76a41) intentionally removed
+        # HiCache's old implicit conversion from FA3 decode to FlashInfer after
+        # making FA3 + kernel HiCache memory-safe. With the same Miles YAML,
+        # that moved decode to FA3 and raised rollout-vs-train KL by about 50x
+        # in our fixed-token parity experiment (Miles experiment 241). Preserve
+        # the historical numerical behavior in the Harmonic fork. An explicit
+        # decode backend always wins, so this remains user-overridable.
+        if (
+            self.hicache_io_backend == "kernel"
+            and self.decode_attention_backend is None
+            and self.attention_backend == "fa3"
+        ):
+            self.decode_attention_backend = "flashinfer"
+            logger.warning(
+                "Harmonic HiCache policy selected FlashInfer instead of the "
+                "implicit FA3 decode backend. FA3 decode raised Qwen3.5-35B "
+                "rollout-vs-train KL by about 50x in Miles experiment 241; "
+                "prefill remains FA3. Set --decode-attention-backend explicitly "
+                "to override this policy."
+            )
 
     def _resolve_layout_io_compatibility(self):
         if (
