@@ -133,6 +133,9 @@ class UnifiedTreeNode:
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
+        # Owner of this node's Mamba checkpoint. This does not affect radix
+        # matching; it only supports replacing stale per-agent checkpoints.
+        self.cache_session_id: Optional[str] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]

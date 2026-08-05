@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import defaultdict
 from dataclasses import replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -53,6 +54,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
+    EvictLayer,
     FullComponent,
     MambaComponent,
     PrepareLoadBackResult,
@@ -307,6 +309,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
         self.session_refs.reset()
+        self._cache_session_id_to_nodes: dict[str, set[UnifiedTreeNode]] = defaultdict(
+            set
+        )
 
         # Reset Controller.
         self.session.slots.clear()
@@ -437,6 +442,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
+        if params.cache_session_id is not None:
+            self._evict_mamba_by_cache_session_id(params.cache_session_id)
         # Fail fast on re-entrancy without touching the in-flight walk.
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         # Pump the resumable insert, applying each step's actions at its barrier.
@@ -680,9 +687,13 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = None
 
         if is_insert:
+            cache_session_id = getattr(req, "cache_session_id", None)
+            if cache_session_id is not None:
+                self._evict_mamba_by_cache_session_id(cache_session_id)
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                cache_session_id=cache_session_id,
             )
 
             # components prepare insert data + return effective cache_len
@@ -766,11 +777,18 @@ class UnifiedRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
+        # Reclaim stale checkpoints before prepare_for_caching_req allocates or
+        # donates a Mamba slot. insert() repeats this for direct callers.
+        cache_session_id = getattr(req, "cache_session_id", None)
+        if cache_session_id is not None:
+            self._evict_mamba_by_cache_session_id(cache_session_id)
+
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            cache_session_id=cache_session_id,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -874,6 +892,52 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     # ---- Internal Helpers ----
+
+    def _track_cache_session(self, node: UnifiedTreeNode) -> None:
+        cache_session_id = node.cache_session_id
+        if cache_session_id is not None:
+            self._cache_session_id_to_nodes[cache_session_id].add(node)
+
+    def _untrack_cache_session(self, node: UnifiedTreeNode) -> None:
+        cache_session_id = node.cache_session_id
+        if cache_session_id is None:
+            return
+        nodes = self._cache_session_id_to_nodes.get(cache_session_id)
+        if nodes is not None:
+            nodes.discard(node)
+            if not nodes:
+                del self._cache_session_id_to_nodes[cache_session_id]
+        node.cache_session_id = None
+
+    def _evict_mamba_by_cache_session_id(self, cache_session_id: str) -> int:
+        """Evict unlocked Mamba state owned by an earlier request in a session."""
+        component = self.components.get(ComponentType.MAMBA)
+        nodes = self._cache_session_id_to_nodes.get(cache_session_id)
+        if component is None or not nodes:
+            return 0
+
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        evicted = 0
+        for node in list(nodes):
+            cd = node.component_data[ComponentType.MAMBA]
+            if cd.value is None and cd.host_value is None:
+                self._untrack_cache_session(node)
+                continue
+            if cd.lock_ref > 0 or cd.host_lock_ref > 0:
+                continue
+            device_freed, host_freed = self.tree_core._evict_component_and_detach_lru(
+                node,
+                component,
+                device_frees,
+                host_frees,
+                target=EvictLayer.ALL,
+            )
+            evicted += device_freed + host_freed
+            self.tree_core._update_evictable_leaf_sets(node)
+
+        self._free_values(device_frees, host_frees)
+        return evicted
 
     def _apply_cache_actions(
         self, actions: list[CacheAction | ComponentAction]

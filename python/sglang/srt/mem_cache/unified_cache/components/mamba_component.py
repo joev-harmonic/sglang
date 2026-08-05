@@ -235,6 +235,8 @@ class MambaComponent(TreeComponent):
         assert params.mamba_value is not None
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
+            node.cache_session_id = params.cache_session_id
+            self.cache._track_cache_session(node)
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
             self.tree_core.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
@@ -243,6 +245,8 @@ class MambaComponent(TreeComponent):
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
+            node.cache_session_id = params.cache_session_id
+            self.cache._track_cache_session(node)
             # move from host LRU to device LRU
             host_lru = self.tree_core.host_lru_lists[self.component_type]
             if host_lru.in_list(node):
@@ -363,6 +367,9 @@ class MambaComponent(TreeComponent):
         ):
             if not host_lru.in_list(node):
                 host_lru.insert_mru(node)
+
+        if cd.value is None and cd.host_value is None:
+            self.cache._untrack_cache_session(node)
 
         return freed, host_freed
 

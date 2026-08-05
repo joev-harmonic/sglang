@@ -658,6 +658,12 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertIsNone(req.session_params)
         self.assertEqual(req[2].session_id, "session1")
 
+        cache_req = GenerateReqInput(
+            text=["Hello", "World"], cache_session_id="agent-1"
+        )
+        cache_req.normalize_batch_and_arguments()
+        self.assertEqual(cache_req[1].cache_session_id, "agent-1")
+
         with self.assertRaisesRegex(ValueError, "cannot both be set"):
             GenerateReqInput(
                 text="Hello",

@@ -825,11 +825,24 @@ class UnifiedRadixCacheSuite:
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:need_size]
 
-    def _insert(self, cache, allocator, req_to_token_pool, tokens, priority=0):
+    def _insert(
+        self,
+        cache,
+        allocator,
+        req_to_token_pool,
+        tokens,
+        priority=0,
+        cache_session_id=None,
+    ):
         """Insert tokens, attaching mamba data when the config has mamba."""
         key = RadixKey(array("q", tokens))
         value = self._alloc(allocator, len(tokens))
-        params = InsertParams(key=key, value=value[: len(key)], priority=priority)
+        params = InsertParams(
+            key=key,
+            value=value[: len(key)],
+            priority=priority,
+            cache_session_id=cache_session_id,
+        )
         if self.cfg.has_mamba:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
@@ -1278,6 +1291,64 @@ class UnifiedRadixCacheSuite:
         result = cache.evict(EvictParams(num_tokens=0, mamba_num=1))
         self.assertGreaterEqual(result.mamba_num_evicted, 1)
         self.assertGreaterEqual(cache.full_evictable_size(), 0)
+        cache.sanity_check()
+
+    def test_mamba_cache_session_reclaims_only_old_unlocked_states(self):
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        def insert(tokens, session):
+            self._insert(
+                cache,
+                allocator,
+                req_to_token_pool,
+                tokens,
+                cache_session_id=session,
+            )
+
+        def match(tokens):
+            return cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            )
+
+        old = self._make_seq(1, 2)
+        unrelated = self._make_seq(100, 2)
+        new = self._make_seq(200, 2)
+        insert(old, "agent-a")
+        insert(unrelated, "agent-b")
+        insert(new, "agent-a")
+
+        # A's old Mamba checkpoint is gone, but its Full KV remains cached.
+        self.assertEqual(len(match(old).device_indices), 0)
+        self.assertEqual(len(match(unrelated).device_indices), len(unrelated))
+        self.assertEqual(len(match(new).device_indices), len(new))
+        self.assertEqual(len(cache._cache_session_id_to_nodes["agent-a"]), 1)
+        self.assertEqual(len(cache._cache_session_id_to_nodes["agent-b"]), 1)
+
+        locked = self._make_seq(300, 2)
+        locked_next = self._make_seq(400, 2)
+        locked_latest = self._make_seq(500, 2)
+        insert(locked, "agent-locked")
+        locked_match = match(locked)
+        lock_result = cache.inc_lock_ref(locked_match.last_device_node)
+
+        # A live request may still use the previous checkpoint, so retain it.
+        insert(locked_next, "agent-locked")
+        self.assertEqual(len(match(locked).device_indices), len(locked))
+        self.assertEqual(len(cache._cache_session_id_to_nodes["agent-locked"]), 2)
+
+        cache.dec_lock_ref(
+            locked_match.last_device_node,
+            DecLockRefParams(
+                swa_uuid_for_lock=getattr(lock_result, "swa_uuid_for_lock", None)
+            ),
+        )
+        insert(locked_latest, "agent-locked")
+        self.assertEqual(len(match(locked).device_indices), 0)
+        self.assertEqual(len(match(locked_next).device_indices), 0)
+        self.assertEqual(len(match(locked_latest).device_indices), len(locked_latest))
+        self.assertEqual(len(cache._cache_session_id_to_nodes["agent-locked"]), 1)
         cache.sanity_check()
 
     def test_mamba_evict_breaks_match(self):
