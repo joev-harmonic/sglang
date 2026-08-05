@@ -102,6 +102,10 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        # Owner of this node's Mamba checkpoint. Unlike session_id, this does
+        # not alter radix matching; it only lets Harmonic reclaim stale agent
+        # checkpoints before storing a newer checkpoint for the same agent.
+        self.cache_session_id: Optional[str] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -465,6 +469,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ct: UnifiedLRUList(ct, self.tree_components) for ct in self.tree_components
         }
         self.session.slots.clear()
+        self._cache_session_id_to_nodes: dict[str, set[UnifiedTreeNode]] = defaultdict(
+            set
+        )
 
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
@@ -599,6 +606,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
+
+        if params.cache_session_id is not None:
+            self._evict_mamba_by_cache_session_id(params.cache_session_id)
 
         key = params.key
         value = params.value
@@ -736,9 +746,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params = None
 
         if is_insert:
+            cache_session_id = getattr(req, "cache_session_id", None)
+            if cache_session_id is not None:
+                self._evict_mamba_by_cache_session_id(cache_session_id)
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                cache_session_id=cache_session_id,
             )
 
             # components prepare insert data + return effective cache_len
@@ -804,11 +818,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
+        # Reclaim stale checkpoints before prepare_for_caching_req allocates or
+        # donates a Mamba slot. insert() repeats this after preparation so the
+        # same rule also applies to direct callers and finished requests.
+        cache_session_id = getattr(req, "cache_session_id", None)
+        if cache_session_id is not None:
+            self._evict_mamba_by_cache_session_id(cache_session_id)
+
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            cache_session_id=cache_session_id,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1256,6 +1278,58 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return result
 
     # ---- Evict Helpers ----
+
+    def _track_cache_session(self, node: UnifiedTreeNode) -> None:
+        cache_session_id = node.cache_session_id
+        if cache_session_id is None:
+            return
+        self._cache_session_id_to_nodes[cache_session_id].add(node)
+
+    def _untrack_cache_session(self, node: UnifiedTreeNode) -> None:
+        cache_session_id = node.cache_session_id
+        if cache_session_id is None:
+            return
+        nodes = self._cache_session_id_to_nodes.get(cache_session_id)
+        if nodes is not None:
+            nodes.discard(node)
+            if not nodes:
+                del self._cache_session_id_to_nodes[cache_session_id]
+        node.cache_session_id = None
+
+    def _evict_mamba_by_cache_session_id(self, cache_session_id: str) -> int:
+        """Evict unlocked Mamba checkpoints previously owned by one agent.
+
+        UnifiedRadixCache can retain Full KV when Mamba is tombstoned, so this
+        removes only the Mamba component instead of discarding reusable KV.
+        Device and host copies are removed together; a locked copy is left in
+        place until a later request for the same session can safely reclaim it.
+        """
+        component = self.components.get(ComponentType.MAMBA)
+        nodes = self._cache_session_id_to_nodes.get(cache_session_id)
+        if component is None or not nodes:
+            return 0
+
+        logger.debug(
+            "Evicting UnifiedRadixCache Mamba states for cache_session_id=%s, "
+            "num_existing_nodes=%d",
+            cache_session_id,
+            len(nodes),
+        )
+        evicted = 0
+        for node in list(nodes):
+            cd = node.component_data[ComponentType.MAMBA]
+            if cd.value is None and cd.host_value is None:
+                self._untrack_cache_session(node)
+                continue
+            if cd.lock_ref > 0 or cd.host_lock_ref > 0:
+                continue
+
+            device_freed, host_freed = self._evict_component_and_detach_lru(
+                node, component, target=EvictLayer.ALL
+            )
+            evicted += device_freed + host_freed
+            self._update_evictable_leaf_sets(node)
+        return evicted
 
     def _cascade_evict(
         self,
