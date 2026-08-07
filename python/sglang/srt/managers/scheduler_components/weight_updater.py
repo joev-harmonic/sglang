@@ -122,8 +122,25 @@ class SchedulerWeightUpdaterManager:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    def _quiesce_for_weight_update(self) -> None:
+        """Drain in-flight device work before mutating model weights.
+
+        An in-place pause stops the scheduler from launching another forward, but
+        it deliberately preserves the current batches and may return while the
+        last overlapped forward is still running.  Synchronize both streams before
+        changing parameter storage, then align ranks before entering collectives.
+        """
+        if self.scheduler is None:
+            return
+        if self.scheduler.enable_overlap:
+            self.scheduler.forward_stream.synchronize()
+        self.scheduler.schedule_stream.synchronize()
+        if self.tp_cpu_group is not None:
+            torch.distributed.barrier(group=self.tp_cpu_group)
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        self._quiesce_for_weight_update()
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
@@ -219,6 +236,7 @@ class SchedulerWeightUpdaterManager:
         assert (
             self._weight_update_in_progress
         ), "update_weights_from_distributed requires an open begin_weight_update session"
+        self._quiesce_for_weight_update()
         with self._observe_weight_load("distributed"):
             # Only the target (main) model joined this process's update group, so it
             # receives the broadcast once; the received weights are then loaded into
@@ -254,6 +272,7 @@ class SchedulerWeightUpdaterManager:
         assert (
             self._weight_update_in_progress
         ), "update_weights_from_tensor requires an open begin_weight_update session"
+        self._quiesce_for_weight_update()
         with self._observe_weight_load("tensor"):
             monkey_patch_torch_reductions()
             named_tensors = MultiprocessingSerializer.deserialize(
@@ -278,6 +297,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        self._quiesce_for_weight_update()
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
@@ -318,6 +338,7 @@ class SchedulerWeightUpdaterManager:
         assert (
             not self._weight_update_in_progress
         ), "begin_weight_update called while a weight-update session is already open"
+        self._quiesce_for_weight_update()
         self._weight_update_selector = recv_req.selector
         for _, runner in self.get_model_runners(recv_req.selector):
             runner.begin_weight_update()
@@ -333,6 +354,7 @@ class SchedulerWeightUpdaterManager:
         assert (
             self._weight_update_in_progress
         ), "end_weight_update called without begin_weight_update"
+        self._quiesce_for_weight_update()
         run_post_load = not self._weight_update_loaded
         for _, runner in self.get_model_runners(self._weight_update_selector):
             runner.end_weight_update(run_post_load=run_post_load)
