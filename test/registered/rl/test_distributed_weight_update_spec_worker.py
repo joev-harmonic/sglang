@@ -28,7 +28,7 @@ def _distributed_req(selector="all"):
     )
 
 
-def _manager(tp_worker, draft_worker):
+def _manager(tp_worker, draft_worker, scheduler=None):
     # metrics_collector defaults to None, so _observe_weight_load is a no-op; the
     # reqs below set flush_cache=False so flush_cache is never called either.
     manager = SchedulerWeightUpdaterManager(
@@ -38,10 +38,100 @@ def _manager(tp_worker, draft_worker):
         memory_saver_adapter=Mock(),
         flush_cache=Mock(return_value=True),
         is_fully_idle=Mock(return_value=True),
+        scheduler=scheduler,
     )
     # update_weights_from_* assert an open begin_weight_update session.
     manager._weight_update_in_progress = True
     return manager
+
+
+@pytest.mark.parametrize("enable_overlap", [False, True])
+def test_quiesce_for_weight_update_drains_streams_then_aligns_ranks(
+    enable_overlap,
+):
+    events = []
+    forward_stream = Mock()
+    forward_stream.synchronize.side_effect = lambda: events.append("forward")
+    schedule_stream = Mock()
+    schedule_stream.synchronize.side_effect = lambda: events.append("schedule")
+    scheduler = SimpleNamespace(
+        enable_overlap=enable_overlap,
+        forward_stream=forward_stream,
+        schedule_stream=schedule_stream,
+    )
+    manager = _manager(tp_worker=Mock(), draft_worker=None, scheduler=scheduler)
+
+    with patch(
+        "torch.distributed.barrier", side_effect=lambda **_: events.append("barrier")
+    ):
+        manager._quiesce_for_weight_update()
+
+    assert events == (["forward"] if enable_overlap else []) + [
+        "schedule",
+        "barrier",
+    ]
+
+
+def test_begin_weight_update_quiesces_before_restoring_weight_storage():
+    events = []
+    forward_stream = Mock()
+    forward_stream.synchronize.side_effect = lambda: events.append("forward")
+    schedule_stream = Mock()
+    schedule_stream.synchronize.side_effect = lambda: events.append("schedule")
+    scheduler = SimpleNamespace(
+        enable_overlap=True,
+        forward_stream=forward_stream,
+        schedule_stream=schedule_stream,
+    )
+    target_runner = Mock()
+    target_runner.begin_weight_update.side_effect = lambda: events.append("restore")
+    manager = _manager(
+        tp_worker=SimpleNamespace(iter_runners=lambda: [("", target_runner)]),
+        draft_worker=None,
+        scheduler=scheduler,
+    )
+    manager._weight_update_in_progress = False
+
+    with patch(
+        "torch.distributed.barrier", side_effect=lambda **_: events.append("barrier")
+    ):
+        manager.begin_weight_update(BeginWeightUpdateReqInput())
+
+    assert events == ["forward", "schedule", "barrier", "restore", "barrier"]
+
+
+def test_distributed_update_quiesces_before_receiving_weights():
+    events = []
+    forward_stream = Mock()
+    forward_stream.synchronize.side_effect = lambda: events.append("forward")
+    schedule_stream = Mock()
+    schedule_stream.synchronize.side_effect = lambda: events.append("schedule")
+    scheduler = SimpleNamespace(
+        enable_overlap=True,
+        forward_stream=forward_stream,
+        schedule_stream=schedule_stream,
+    )
+    weights = object()
+    target_runner = Mock()
+    target_runner.weight_updater.receive_weights_from_distributed.side_effect = (
+        lambda *_: events.append("receive") or weights
+    )
+    manager = _manager(
+        tp_worker=SimpleNamespace(
+            model_runner=target_runner,
+            iter_runners=lambda: [("", target_runner)],
+        ),
+        draft_worker=None,
+        scheduler=scheduler,
+    )
+
+    with patch(
+        "torch.distributed.barrier", side_effect=lambda **_: events.append("barrier")
+    ):
+        manager.update_weights_from_distributed(_distributed_req())
+
+    assert events == ["forward", "schedule", "barrier", "receive"]
+    target_runner.weight_updater.load_weights.assert_called_once_with(weights)
 
 
 def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
