@@ -538,6 +538,13 @@ class UnifiedMambaPool(MambaPool):
         self.linear_replayssm_cache_len = 16
         self.replayssm_write_pos = None
         self.replayssm_is_kda = False
+        self.enable_gdn_replayssm_spec = False
+        self.replayssm_spec_fold = False
+        self.replayssm_cache_base = None
+        self.replayssm_is_flush = None
+        self.debug_memory_pool = False
+        self.conv_shard_groups = None
+        self.conv_slice_axis = spec.conv_slice_axis
 
         assert (
             conv_views[0].shape[0] == self.num_mamba_layers
