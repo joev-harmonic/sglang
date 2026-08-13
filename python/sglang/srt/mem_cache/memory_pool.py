@@ -1475,13 +1475,29 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return mamba_value_donated
 
     def free_mamba_cache(
-        self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
-    ):
+        self,
+        req: Req,
+        mamba_ping_pong_track_buffer_to_keep: Optional[int] = None,
+        *,
+        keep_live_state: bool = False,
+    ) -> None:
+        """Release a request's Mamba slots, optionally retaining live for radix."""
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
-        self.mamba_allocator.free(mamba_index.unsqueeze(0))
+        if not keep_live_state:
+            self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.mamba_pool_idx = None
 
+        self._free_mamba_ping_pong_cache(
+            req,
+            mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
+        )
+
+    def _free_mamba_ping_pong_cache(
+        self,
+        req: Req,
+        mamba_ping_pong_track_buffer_to_keep: Optional[int] = None,
+    ) -> None:
         if self.enable_mamba_extra_buffer:
             mamba_ping_pong_track_buffer_to_free = (
                 self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]

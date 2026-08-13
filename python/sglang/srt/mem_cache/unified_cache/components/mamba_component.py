@@ -74,6 +74,9 @@ class MambaComponent(TreeComponent):
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
         self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
+        self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
+        self.is_eagle = params.is_eagle
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -548,7 +551,23 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
-        if self.cache.enable_mamba_extra_buffer:
+        cache_session_live_state = self._should_cache_session_live_state(
+            req, is_finished=is_finished
+        )
+        if cache_session_live_state:
+            # If we have reached the end of the response, cache the full
+            # committed sequence rather than truncating to the last
+            # ping-pong checkpoint.
+            #
+            # With overlap scheduling, this actually caches one additional
+            # token beyond EOT. This is unavoidable without another Mamba
+            # state copy, and is usually beneficial:
+            # - The first token after the end of turn is almost always
+            #   predictable (a newline, next-turn delimiter, etc.).
+            # - A missed prediction cannot cause incorrect output. The radix
+            #   key diverges before this checkpoint, causing only a cache miss.
+            cache_len = token_ids_len
+        elif self.enable_mamba_extra_buffer:
             cache_len = req.mamba_last_track_seqlen
         else:
             cache_len = token_ids_len
@@ -569,7 +588,9 @@ class MambaComponent(TreeComponent):
         if is_finished:
             if cache_len is None:
                 cache_len = 0
-            if self.cache.enable_mamba_extra_buffer:
+            if cache_session_live_state:
+                active_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+            elif self.enable_mamba_extra_buffer:
                 keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
                     req
                 )
@@ -628,41 +649,60 @@ class MambaComponent(TreeComponent):
         insert_params: Optional[InsertParams] = None,
     ) -> None:
         if is_finished:
-            mamba_value_inserted = (
+            radix_retained_mamba_value = (
                 insert_result is not None and not insert_result.mamba_exist
             )
             pool = self.cache.req_to_token_pool
 
             if self.int8_ckpt_pool is not None:
                 insert_value_unused = (
-                    not mamba_value_inserted
+                    not radix_retained_mamba_value
                     and insert_params is not None
                     and insert_params.mamba_value is not None
                 )
                 if insert_value_unused:
                     self._free_mamba_value(insert_params.mamba_value)
-                pool.free_mamba_cache(req)
-                return
 
-            if self.cache.enable_mamba_extra_buffer:
-                keep_idx = (
-                    pool.get_mamba_ping_pong_keep_idx(req)
-                    if mamba_value_inserted
-                    else None
+            cache_session_live_state = self._should_cache_session_live_state(
+                req, is_finished=True
+            )
+            keep_live_state = (
+                radix_retained_mamba_value
+                and self.int8_ckpt_pool is None
+                and (cache_session_live_state or not self.enable_mamba_extra_buffer)
+            )
+            keep_idx = (
+                pool.get_mamba_ping_pong_keep_idx(req)
+                if (
+                    radix_retained_mamba_value
+                    and self.int8_ckpt_pool is None
+                    and self.enable_mamba_extra_buffer
+                    and not cache_session_live_state
                 )
-                pool.free_mamba_cache(
-                    req, mamba_ping_pong_track_buffer_to_keep=keep_idx
-                )
-                return
-
-            if not mamba_value_inserted:
-                pool.free_mamba_cache(req)
+                else None
+            )
+            pool.free_mamba_cache(
+                req,
+                mamba_ping_pong_track_buffer_to_keep=keep_idx,
+                keep_live_state=keep_live_state,
+            )
         else:
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
             ):
                 self._free_mamba_value(insert_params.mamba_value)
             req.mamba_last_track_seqlen = None
+
+    def _should_cache_session_live_state(self, req: Req, *, is_finished: bool) -> bool:
+        """Whether completion should cache the request's live Mamba state."""
+        return (
+            is_finished
+            and self.enable_mamba_extra_buffer
+            and req.cache_session_id is not None
+            and self.cache.page_size == 1
+            and not self.is_eagle
+            and self.int8_ckpt_pool is None
+        )
 
     # ---- HiCache Hooks ----
 

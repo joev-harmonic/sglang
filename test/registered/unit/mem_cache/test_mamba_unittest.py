@@ -540,7 +540,71 @@ class TestMamba(unittest.TestCase):
         self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
-    def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
+    def test_session_completion_caches_live_state(self):
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator(enable_mamba_extra_buffer=True)
+        )
+        tokens = [1, 2, 3, 4]
+        initial_available = req_to_token_pool.mamba_allocator.available_size()
+        req = make_dummy_req()
+        live_slot = req.mamba_pool_idx.item()
+        scratch_slots = set(req.mamba_ping_pong_track_buffer.tolist())
+
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.cache_session_id = "agent-session"
+        req.kv_committed_len = len(tokens)
+        req.cache_protected_len = 0
+        req.last_node = tree.root_node
+        req.mamba_last_track_seqlen = 2
+        kv_indices = allocator.alloc(len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+
+        tree.cache_finished_req(req, kv_len_to_handle=len(tokens))
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(match.device_indices), len(tokens))
+        self.assertEqual(match.last_device_node.mamba_value.item(), live_slot)
+        self.assertNotIn(live_slot, scratch_slots)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), initial_available - 1
+        )
+
+    def test_non_session_completion_keeps_tracked_snapshot_behavior(self):
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator(enable_mamba_extra_buffer=True)
+        )
+        tokens = [1, 2, 3, 4]
+        req = make_dummy_req()
+        live_slot = req.mamba_pool_idx.item()
+        keep_idx = req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+        tracked_slot = req.mamba_ping_pong_track_buffer[keep_idx].item()
+
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.kv_committed_len = len(tokens)
+        req.cache_protected_len = 0
+        req.last_node = tree.root_node
+        req.mamba_last_track_seqlen = 2
+        kv_indices = allocator.alloc(len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+
+        tree.cache_finished_req(req, kv_len_to_handle=len(tokens))
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(match.device_indices), 2)
+        self.assertEqual(match.last_device_node.mamba_value.item(), tracked_slot)
+        self.assertNotEqual(match.last_device_node.mamba_value.item(), live_slot)
+
+    def _setup_tree_and_allocator(
+        self,
+        enable_kv_cache_events=False,
+        *,
+        enable_mamba_extra_buffer=False,
+        is_eagle=False,
+    ):
         """Helper to create a MambaRadixCache with allocator for testing."""
         server_args = ServerArgs(model_path="dummy", page_size=1)
         # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
@@ -585,7 +649,7 @@ class TestMamba(unittest.TestCase):
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
             mamba_layer_ids=mamba_layers,
-            enable_mamba_extra_buffer=False,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=3,
         )
         pool = HybridLinearKVPool(
@@ -612,6 +676,8 @@ class TestMamba(unittest.TestCase):
             page_size=1,
             disable=False,
             enable_kv_cache_events=enable_kv_cache_events,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+            is_eagle=is_eagle,
         )
         tree = MambaRadixCache(params=params)
 
