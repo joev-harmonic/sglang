@@ -176,6 +176,10 @@ class BaseTopkCapturer:
             forward_batch, can_run_graph, cuda_graph_batch
         )
         if no_copy_to_cpu:
+            # The slice aliases the process-wide capture buffer, which the next
+            # overlapped forward rewrites. Snapshot it on the forward stream
+            # before result D2H is released to the independent copy stream.
+            slice_gpu = slice_gpu.clone()
             return TopkCaptureOutput(
                 out_cache_loc=forward_batch.out_cache_loc,
                 topk=slice_gpu,
