@@ -451,6 +451,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
+        self.is_eagle = params.is_eagle
         self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
@@ -560,9 +561,24 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_len_to_handle
         ]
+        cache_session_live_state = False
 
         if is_insert:
-            if self.enable_mamba_extra_buffer:
+            cache_session_live_state = self._should_cache_session_live_state(req)
+            if cache_session_live_state:
+                # If we have reached the end of the response, cache the full
+                # committed sequence rather than truncating to the last
+                # ping-pong checkpoint.
+                #
+                # With overlap scheduling, this actually caches one additional
+                # token beyond EOT. This is unavoidable without another Mamba
+                # state copy, and is usually beneficial:
+                # - The first token after the end of turn is almost always
+                #   predictable (a newline, next-turn delimiter, etc.).
+                # - A missed prediction cannot cause incorrect output. The radix
+                #   key diverges before this checkpoint, causing only a cache miss.
+                cache_len = len(token_ids)
+            elif self.enable_mamba_extra_buffer:
                 cache_len = req.mamba_last_track_seqlen
             else:
                 cache_len = len(token_ids)
@@ -598,7 +614,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
-            if self.enable_mamba_extra_buffer:
+            if cache_session_live_state:
+                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+                mamba_ping_pong_track_buffer_to_keep = None
+            elif self.enable_mamba_extra_buffer:
                 mamba_ping_pong_track_buffer_to_keep = (
                     self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                 )
@@ -647,19 +666,21 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None
 
-        # With int8 checkpoints the radix owns an int8 slot (not the request's active
-        # slot), so the active mamba slot must always be returned to the active pool.
-        free_mamba_cache = (
-            True
-            if (self.enable_mamba_extra_buffer or self.int8_ckpt_pool is not None)
-            else mamba_exist
-        )
+        radix_retained_mamba_value = not mamba_exist
 
-        if free_mamba_cache:
-            self.req_to_token_pool.free_mamba_cache(
-                req,
-                mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
-            )
+        # no_buffer already transfers its live slot to radix by retaining it
+        # after a successful insert. Session-aware extra_buffer uses the same
+        # ownership rule; its ping-pong slots remain scratch and are released.
+        keep_live_state = (
+            radix_retained_mamba_value
+            and self.int8_ckpt_pool is None
+            and (cache_session_live_state or not self.enable_mamba_extra_buffer)
+        )
+        self.req_to_token_pool.free_mamba_cache(
+            req,
+            mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
+            keep_live_state=keep_live_state,
+        )
 
         self.dec_lock_ref(req.last_node)
 
@@ -1084,6 +1105,21 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     ##### Internal Helper Functions #####
+
+    def _should_cache_session_live_state(self, req: Req) -> bool:
+        """Whether to cache a finished session request's live Mamba state.
+
+        EAGLE/Frozen-KV-MTP keeps the existing speculative snapshot path.  An
+        int8 checkpoint pool cannot mix active-pool indices into its radix
+        values, so it also retains the existing quantized checkpoint path.
+        """
+        return (
+            self.enable_mamba_extra_buffer
+            and req.cache_session_id is not None
+            and self.page_size == 1
+            and not self.is_eagle
+            and self.int8_ckpt_pool is None
+        )
 
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""

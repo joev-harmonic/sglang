@@ -4267,6 +4267,180 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         self.assertEqual(cache.mamba_evictable_size(), 0)
 
 
+class TestUnifiedSessionLiveMambaState(CustomTestCase):
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        mamba_cache_size=12,
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def _make_finished_req(
+        self, cache, allocator, req_to_token_pool, tokens, *, cache_session_id
+    ):
+        req = Req(
+            rid=f"session-live-{cache_session_id}",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            cache_session_id=cache_session_id,
+        )
+        req_to_token_pool.alloc([req])
+        req.output_ids = array("q")
+        req.kv_committed_len = len(tokens)
+        req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.last_node = cache.root_node
+        # Deliberately stale: session completion must ignore this snapshot,
+        # while the non-session control below must retain the old behavior.
+        req.mamba_last_track_seqlen = 2
+        kv_indices = allocator.alloc(len(tokens))
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        return req
+
+    def _cache_finished(self, cache, req):
+        cache.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+        )
+
+    def test_session_completion_transfers_live_slot_at_full_length(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        initial_available = req_to_token_pool.mamba_allocator.available_size()
+        tokens = [1, 2, 3, 4]
+        req = self._make_finished_req(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens,
+            cache_session_id="agent-session",
+        )
+        live_slot = req.mamba_pool_idx.item()
+        scratch_slots = set(req.mamba_ping_pong_track_buffer.tolist())
+
+        self._cache_finished(cache, req)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        cached_slot = match.last_device_node.component_data[
+            ComponentType.MAMBA
+        ].value.item()
+        self.assertEqual(len(match.device_indices), len(tokens))
+        self.assertEqual(cached_slot, live_slot)
+        self.assertNotIn(cached_slot, scratch_slots)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        # The live slot remains radix-owned; both scratch slots return.
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), initial_available - 1
+        )
+        cache.sanity_check()
+
+    def test_appended_turn_limit_selects_full_live_slot(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = [1, 2, 3, 4]
+        req = self._make_finished_req(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens,
+            cache_session_id="appended-turn",
+        )
+        live_slot = req.mamba_pool_idx.item()
+
+        self._cache_finished(cache, req)
+
+        # Req._compute_max_prefix_len caps a five-token appended turn at four
+        # cached tokens.  The full completed state must therefore be selected.
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens + [5]), limit=len(tokens)))
+        )
+        cached_slot = match.last_device_node.component_data[
+            ComponentType.MAMBA
+        ].value.item()
+        self.assertEqual(len(match.device_indices), len(tokens))
+        self.assertEqual(cached_slot, live_slot)
+        cache.sanity_check()
+
+    def test_exact_continuation_limit_does_not_select_too_new_state(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = [1, 2, 3, 4]
+        req = self._make_finished_req(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens,
+            cache_session_id="exact-continuation",
+        )
+        live_slot = req.mamba_pool_idx.item()
+
+        self._cache_finished(cache, req)
+
+        # An exact continuation caps the match at N-1 so the last token can be
+        # recomputed for its logit.  The state after N tokens is too new and
+        # must remain on the suffix rather than being attached to the split
+        # N-1 prefix node.  With no earlier checkpoint in this fixture, the
+        # component-consensus match correctly falls back to root.
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens), limit=len(tokens) - 1))
+        )
+        self.assertEqual(len(match.device_indices), 0)
+        self.assertIs(match.last_device_node, cache.root_node)
+        self.assertIn(live_slot, cache.all_mamba_values_flatten().tolist())
+        cache.sanity_check()
+
+    def test_non_session_completion_keeps_tracked_snapshot_behavior(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = [1, 2, 3, 4]
+        req = self._make_finished_req(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens,
+            cache_session_id=None,
+        )
+        live_slot = req.mamba_pool_idx.item()
+        keep_idx = req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+        tracked_slot = req.mamba_ping_pong_track_buffer[keep_idx].item()
+
+        self._cache_finished(cache, req)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        cached_slot = match.last_device_node.component_data[
+            ComponentType.MAMBA
+        ].value.item()
+        self.assertEqual(len(match.device_indices), 2)
+        self.assertEqual(cached_slot, tracked_slot)
+        self.assertNotEqual(cached_slot, live_slot)
+        cache.sanity_check()
+
+    def test_speculative_session_keeps_tracked_snapshot_behavior(self):
+        cfg = replace(self.cfg, is_eagle=True)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        tokens = [1, 2, 3, 4]
+        req = self._make_finished_req(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens,
+            cache_session_id="spec-session",
+        )
+        keep_idx = req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+        tracked_slot = req.mamba_ping_pong_track_buffer[keep_idx].item()
+
+        self._cache_finished(cache, req)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        cached_slot = match.last_device_node.component_data[
+            ComponentType.MAMBA
+        ].value.item()
+        self.assertEqual(len(match.device_indices), 2)
+        self.assertEqual(cached_slot, tracked_slot)
+        cache.sanity_check()
+
+
 _CONFIGS: list[CacheConfig] = [
     CacheConfig(page_size=1, components=(ComponentType.FULL,)),
     CacheConfig(page_size=4, components=(ComponentType.FULL,)),
