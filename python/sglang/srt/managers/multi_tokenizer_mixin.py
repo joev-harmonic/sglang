@@ -674,6 +674,7 @@ class TokenizerWorker(TokenizerManager):
         )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
+        self.auto_create_handle_loop()
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
@@ -691,6 +692,7 @@ class TokenizerWorker(TokenizerManager):
                 await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        self.auto_create_handle_loop()
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
         self._dispatch_to_scheduler(obj)
