@@ -8,6 +8,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import (
+    ContinueGenerationReqInput,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
 )
@@ -97,6 +98,23 @@ class TestTokenizerPauseUpdateLocking(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(update_task, timeout=1.0)
         await worker.model_update_lock.release_reader()
         self.assertFalse(await worker.model_update_lock.is_locked())
+
+    async def test_multi_tokenizer_pause_and_continue_start_response_loop(self):
+        worker = TokenizerWorker.__new__(TokenizerWorker)
+        worker.auto_create_handle_loop = MagicMock()
+
+        def dispatch_with_broadcast(_obj):
+            asyncio.get_running_loop().call_soon(
+                worker._pause_continue_future.set_result, True
+            )
+
+        worker._dispatch_to_scheduler = MagicMock(side_effect=dispatch_with_broadcast)
+        worker._pause_continue_future = None
+
+        await worker.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        await worker.continue_generation(ContinueGenerationReqInput())
+
+        self.assertEqual(worker.auto_create_handle_loop.call_count, 2)
 
 
 if __name__ == "__main__":
