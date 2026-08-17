@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    get_model_loader,
+    load_model_weights,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
@@ -139,7 +143,12 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
+            is_full_load = weight_name_filter is None and not getattr(
+                model, "flash_rl_initial_load_complete", False
+            )
+            loader.load_weights_and_postprocess(
+                model, iter, target_device, is_full_load=is_full_load
+            )
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
@@ -182,7 +191,7 @@ class WeightUpdater:
 
     def load_weights(self: WeightUpdater, weights) -> None:
         """Load an in-memory list of (name, tensor) weights into this runner's model."""
-        self.get_model().load_weights(weights)
+        load_model_weights(self.get_model(), weights, is_full_load=False)
 
     def receive_weights_from_distributed(
         self: WeightUpdater,
@@ -300,7 +309,7 @@ class WeightUpdater:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.get_model(), named_tensors)
         elif load_format is None:
-            self.get_model().load_weights(named_tensors)
+            load_model_weights(self.get_model(), named_tensors, is_full_load=False)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
@@ -333,7 +342,7 @@ class WeightUpdater:
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
-        self.get_model().load_weights(reconstructed_tensors)
+        load_model_weights(self.get_model(), reconstructed_tensors, is_full_load=False)
 
         return True, "Success"
 
