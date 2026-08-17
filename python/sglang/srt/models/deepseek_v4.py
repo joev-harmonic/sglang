@@ -3291,7 +3291,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             time.perf_counter() - tic - compile_secs,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn=False,
+        *,
+        is_full_load: bool = True,
+    ):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -3606,34 +3612,35 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
-        unloaded_params = params_dict.keys() - loaded_params
+        if is_full_load:
+            unloaded_params = params_dict.keys() - loaded_params
 
-        skipped_checking_patterns = [
-            "attn_mqa.k_scale",
-            "attn_mqa.v_scale",
-            "blockscale_swizzled",
-        ]
-        if not self.pp_group.is_first_rank:
-            skipped_checking_patterns.append("embed_tokens")
-        if not self.pp_group.is_last_rank:
-            skipped_checking_patterns.append("model.norm.")
-            skipped_checking_patterns.extend(["lm_head", "hc_head_"])
-        if is_nextn:
-            skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
-        unloaded_params = {
-            p
-            for p in unloaded_params
-            if all(
-                skipped_checking_pattern not in p
-                for skipped_checking_pattern in skipped_checking_patterns
-            )
-        }
-        if unloaded_params:
-            logger.warning(
-                "Some weights are not initialized from checkpoints: "
-                f"count={len(unloaded_params)}. "
-                "Ignore this message for RL weight update."
-            )
+            skipped_checking_patterns = [
+                "attn_mqa.k_scale",
+                "attn_mqa.v_scale",
+                "blockscale_swizzled",
+            ]
+            if not self.pp_group.is_first_rank:
+                skipped_checking_patterns.append("embed_tokens")
+            if not self.pp_group.is_last_rank:
+                skipped_checking_patterns.append("model.norm.")
+                skipped_checking_patterns.extend(["lm_head", "hc_head_"])
+            if is_nextn:
+                skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
+            unloaded_params = {
+                p
+                for p in unloaded_params
+                if all(
+                    skipped_checking_pattern not in p
+                    for skipped_checking_pattern in skipped_checking_patterns
+                )
+            }
+            if unloaded_params:
+                logger.warning(
+                    "Some weights are not initialized from checkpoints: "
+                    f"count={len(unloaded_params)}. "
+                    "Ignore this message for RL weight update."
+                )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
