@@ -44,6 +44,78 @@ _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 # through.
 _STALE_IN_THE_MODEL_CONFIG = frozenset({"speculative_algorithm"})
 
+# The same staleness, arriving through the model-override registries rather than
+# through a handler keyword. `_handle_model_specific_adjustments` builds the
+# model configuration at `server_args.py:get_model_config()` and *then* calls
+# `collect_model_override_declarations`, so a provider that decides one of these
+# decides it after the object that read it was built. Both positions are read
+# inside that one handler body, which is the only scope where comparing them
+# means anything.
+#
+# Pinned rather than fixed for the same reason as the field above: fixing it
+# means moving the build or the collection, and that is a separate change. What
+# this set buys is that the four are *named* -- a fifth field landing in the
+# same position fails until someone looks at it, and fixing the ordering fails
+# it too.
+_STALE_FROM_THE_REGISTRIES = frozenset(
+    {
+        "disable_hybrid_swa_memory",
+        "dtype",
+        "enable_multi_layer_eagle",
+        "quantization",
+    }
+)
+
+
+def _registry_declared_fields():
+    """What the live registries and passes declare.
+
+    Imported from the chain ratchet by path instead of re-derived: two
+    derivations of the same set drift, and the one that drifts narrower makes
+    this check quietly vacuous. Keying on `self._declare(...)` alone is what
+    hid these four -- 26 of the providers register through a helper call, and
+    none of them spell a keyword this file can see.
+    """
+    import importlib.util
+
+    ratchet = (
+        pathlib.Path(__file__).resolve().parent.parent / "test_chain_read_ratchet.py"
+    )
+    spec = importlib.util.spec_from_file_location("_chain_ratchet_for_pin", ratchet)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._declared_by_registry_and_passes()
+
+
+def _registry_collection_is_after_the_build():
+    """(collection line, first build line) inside the model-specific handler."""
+    tree = ast.parse((_SRT / "server_args.py").read_text(encoding="utf-8-sig"))
+    handler = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_handle_model_specific_adjustments"
+    )
+    build = collect = None
+    for node in ast.walk(handler):
+        if not isinstance(node, ast.Call):
+            continue
+        # Both spellings: `self.get_model_config()` is an Attribute call and the
+        # collection is a bare Name call. Keying on one shape is how the first
+        # version of this helper found nothing and passed vacuously.
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            name = func.attr
+        elif isinstance(func, ast.Name):
+            name = func.id
+        else:
+            continue
+        if name == "get_model_config" and build is None:
+            build = node.lineno
+        if name == "collect_model_override_declarations" and collect is None:
+            collect = node.lineno
+    return collect, build
+
 
 def _server_args_names(tree, path):
     names = {"self"} if path.name == "server_args.py" else {"server_args"}
@@ -231,7 +303,11 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
             if field in wanted and line > build_line:
                 declared_at[field] = max(declared_at.get(field, first_build[0]), 10**6)
 
-        known = _READ_BEFORE_RESOLUTION | _STALE_IN_THE_MODEL_CONFIG
+        known = (
+            _READ_BEFORE_RESOLUTION
+            | _STALE_IN_THE_MODEL_CONFIG
+            | _STALE_FROM_THE_REGISTRIES
+        )
         late = sorted(
             field
             for field, index in declared_at.items()
@@ -243,6 +319,35 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
             "resolution decides these after it builds the ModelConfig that reads "
             f"them, so the model configuration describes a half-resolved input "
             f"(first build: step {first_build[0]}, {first_build[1]}): {late}",
+        )
+
+    def test_the_registry_stale_set_is_exactly_what_is_late(self):
+        """Equality, not membership.
+
+        A fifth field the registries decide after the build fails here, and so
+        does fixing the ordering -- either way someone has to come back and
+        read this. The earlier version of this file derived declarations only
+        from `self._declare(...)` keywords, so it passed while these four were
+        already stale.
+        """
+        collect_line, build_line = _registry_collection_is_after_the_build()
+        self.assertIsNotNone(build_line, "the handler no longer builds a ModelConfig")
+        self.assertIsNotNone(
+            collect_line, "the handler no longer collects registry declarations"
+        )
+        reads = _constructor_reads()
+        registry = _registry_declared_fields()
+        self.assertGreater(
+            len(registry), 20, "the registry-declared set collapsed; nothing to compare"
+        )
+        late = frozenset(reads & registry) if collect_line > build_line else frozenset()
+        self.assertEqual(
+            sorted(late),
+            sorted(_STALE_FROM_THE_REGISTRIES),
+            "the set of ModelConfig-read fields the registries decide after the "
+            f"build changed (collection at line {collect_line}, build at line "
+            f"{build_line}); read the comment on _STALE_FROM_THE_REGISTRIES "
+            "before editing it",
         )
 
     def test_the_pinned_stale_field_is_still_stale(self):
