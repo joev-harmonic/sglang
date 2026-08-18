@@ -266,11 +266,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             dist_timeout=self.server_args.dist_timeout,
         )
 
-        from sglang.srt.runtime_context import get_context
+        from sglang.srt.runtime_context import get_context, publish
         from sglang.srt.server_args import ServerArgs as SrtServerArgs
 
         if get_context()._server_args is None:
-            get_context().set_server_args(SrtServerArgs(model_path="dummy"))
+            # Nothing published in this worker, so install a placeholder the
+            # way everything else does -- publish resolves and projects it.
+            # Resolving it here instead would make this a caller of the
+            # resolution gate, which is reserved for program entries.
+            publish(SrtServerArgs(model_path="dummy"), role="diffusion_gpu_worker")
 
         # set proc title
         if model_parallel_is_initialized():

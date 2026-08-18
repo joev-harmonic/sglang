@@ -716,6 +716,10 @@ def main():
     args, unknown_args = parser.parse_known_args()
 
     server_args = ServerArgs.from_cli_args(args, unknown_args)
+    # Resolution decides what this program then reads (the parallel sizes, the
+    # memory fraction, a rewritten model path), and construction no longer runs
+    # it. The launcher below asks the same gate and gets a no-op.
+    server_args.resolve_once()
     bench_args = BenchArgs.from_cli_args(args)
 
     set_global_server_args(server_args)

@@ -27,6 +27,7 @@ import copy
 import dataclasses
 import json
 import os
+import pathlib
 import shutil
 import tempfile
 import unittest
@@ -34,6 +35,7 @@ import unittest.mock
 
 import torch
 
+import sglang
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
@@ -188,13 +190,13 @@ _STICKY_ACROSS_RESOLUTIONS = frozenset({"mm_feature_transport"})
 _NOT_COMPARABLE = frozenset({"random_seed"})
 
 
-class TestResolutionIsReproducible(CustomTestCase):
-    def _config_dir(self, config: dict = None) -> str:
-        config_dir = tempfile.mkdtemp(prefix="resolution_repro_")
-        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
-        with open(os.path.join(config_dir, "config.json"), "w") as handle:
-            json.dump(config or _MINI_CONFIG, handle)
-        return config_dir
+class _RestoresProcessState:
+    """Resolution leaves process state behind, so a case that resolves has to
+    put it back. `_handle_multimodal_feature_transport` sets
+    `SGLANG_USE_CUDA_IPC_TRANSPORT` and the same handler reads `is_set()` on the
+    way in, so one resolution is visible to the next one in this process -- and
+    `TestMultimodalFeatureTransport` is the case that notices.
+    """
 
     def _process_state(self):
         """What a resolution may leave behind: the environment and the
@@ -237,13 +239,25 @@ class TestResolutionIsReproducible(CustomTestCase):
         # to catch, turned into a pass.
         unittest.TestCase._callTestMethod(self, method)
 
+
+class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
+    def _config_dir(self, config: dict = None) -> str:
+        config_dir = tempfile.mkdtemp(prefix="resolution_repro_")
+        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as handle:
+            json.dump(config or _MINI_CONFIG, handle)
+        return config_dir
+
     def _resolved(self, model_path: str, **kwargs) -> ServerArgs:
         # device="cuda" keeps the golden path host-independent: an
         # accelerator-less runner resolves only the base platform, where
         # get_device() raises.
         kwargs.setdefault("device", "cuda")
         kwargs.setdefault("random_seed", 42)
-        return ServerArgs(model_path=model_path, **kwargs)
+        server_args = ServerArgs(model_path=model_path, **kwargs)
+        # Construction is inert; resolution is its own act.
+        server_args.resolve_once()
+        return server_args
 
     def _comparable(self, server_args: ServerArgs) -> dict:
         """The dataclass fields, and only those.
@@ -409,6 +423,39 @@ class TestResolutionIsReproducible(CustomTestCase):
                     list(getattr(resolved, "_resolved_overrides", [])), declarations
                 )
 
+    def test_the_gate_closes_on_the_dummy_path_too(self):
+        """The dummy model leaves the pipeline early, and the gate still shuts.
+
+        That exit is above the materialization the gate reads, so a dummy
+        record answered "not resolved yet" forever and every publish of one ran
+        the handlers again. Nothing about the early exit makes a second pass
+        safe -- the handlers above it declare and apply like any other -- and
+        the four that do run happening to be idempotent today is what the gate
+        exists to stop depending on. So this counts entries rather than
+        comparing values: the values agree either way.
+        """
+        self._restore_process_state(self._pristine_state)
+        record = ServerArgs(model_path="dummy")
+        record.resolve_once()
+
+        entries = []
+        original = ServerArgs._run_resolution_pipeline
+
+        def counted(self):
+            entries.append(1)
+            return original(self)
+
+        with unittest.mock.patch.object(
+            ServerArgs, "_run_resolution_pipeline", counted
+        ):
+            record.resolve_once()
+        self.assertEqual(
+            entries,
+            [],
+            "a resolved dummy record entered the pipeline again, so every "
+            "publish of one re-runs the handlers",
+        )
+
     def test_the_declaration_provenance_is_reproducible(self):
         model_path = self._config_dir()
         first = self._resolved(model_path)
@@ -424,6 +471,335 @@ class TestResolutionIsReproducible(CustomTestCase):
         # And the first record's own list is untouched by the second
         # resolution -- a shared mutable would show up here.
         self.assertEqual(getattr(first, "_resolved_overrides", None), first_provenance)
+
+
+class TestProgramsResolveBeforeReadingResolution(CustomTestCase):
+    """A program that builds its own record resolves it before reading what
+    resolution decides.
+
+    Construction is inert, so a program that builds a record and then reads a
+    resolution-written field reads the CLI default. Two of these shipped past
+    the earlier censuses because those are rooted at the `sglang` package: the
+    model gateway's launcher sized its worker plan from a raw `dp_size`
+    (`--dwdp-size 4` launched one server instead of four) and a speculative
+    benchmark forwarded `--mem-fraction-static None` to the server it spawns.
+    So the universe here is the *repository*, not the package.
+    """
+
+    # Not program entries: they hand the record to something that resolves it,
+    # or they are the mechanism. Each needs a reason, and the check below is
+    # what makes a new entry state one.
+    _EXEMPT: dict = {}
+
+    def _repo_root(self):
+        # <repo>/python/sglang/__init__.py -> <repo>
+        root = pathlib.Path(next(iter(sglang.__path__))).resolve().parents[1]
+        if root.name == "python":
+            root = root.parent
+        return root
+
+    def _written_fields(self):
+        """Fields resolution declares, read out of the pipeline's own source.
+
+        Deliberately local: the chain ratchet has a wider derivation (it also
+        walks the model-override registries), but it arrives later in this
+        series, and a check that imports it would fail at this PR's boundary.
+        Coarser is fine here -- what this needs is the fields the entries below
+        actually read -- and the floor keeps it from drifting narrower.
+        """
+        import ast
+
+        srt = pathlib.Path(next(iter(sglang.__path__))).resolve() / "srt"
+        declarers = {"_declare", "declare_resolution", "declare_late_resolution"}
+        fields = set()
+        for name in ("server_args.py", "arg_groups/overrides.py"):
+            tree = ast.parse((srt / name).read_text(encoding="utf-8-sig"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                called = (
+                    func.attr
+                    if isinstance(func, ast.Attribute)
+                    else getattr(func, "id", "")
+                )
+                if called in declarers:
+                    fields |= {kw.arg for kw in node.keywords if kw.arg}
+        return fields
+
+    def _candidates(self, root):
+        """Source files that build a record, with the names they bind it to."""
+        import ast
+
+        skip = {".git", "build", "dist", "node_modules", ".venv", "target"}
+        found = {}
+        for path in sorted(root.rglob("*.py")):
+            parts = set(path.relative_to(root).parts)
+            if parts & skip:
+                continue
+            rel = path.relative_to(root).as_posix()
+            # Tests build raw records on purpose -- that is what they assert on.
+            if rel.startswith("test/") or "/test/" in rel or "/tests/" in rel:
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    targets = node.targets
+                elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+                    # `server_args: ServerArgs = ServerArgs.from_cli_args(args)`
+                    # is an AnnAssign; keying on `Assign` alone is how the
+                    # benchmark entry was missed the first time this was counted.
+                    targets = [node.target]
+                else:
+                    continue
+                call = getattr(node, "value", None)
+                if not isinstance(call, ast.Call):
+                    continue
+                func = call.func
+                builds = (isinstance(func, ast.Name) and func.id == "ServerArgs") or (
+                    isinstance(func, ast.Attribute) and func.attr == "from_cli_args"
+                )
+                if builds:
+                    names |= {t.id for t in targets if isinstance(t, ast.Name)}
+            if names:
+                found[rel] = (tree, names, path)
+        return found
+
+    def test_every_program_that_builds_a_record_resolves_it(self):
+        import ast
+
+        root = self._repo_root()
+        candidates = self._candidates(root)
+        self.assertGreater(
+            len(candidates),
+            10,
+            f"only {len(candidates)} files build a record under {root}; either "
+            "this is not a source checkout or the scan broke",
+        )
+        written = self._written_fields()
+        self.assertGreater(len(written), 50, "the written-field set collapsed")
+        # The two fields the escaped entries actually read. If the derivation
+        # ever stops seeing these, this check goes quiet on exactly the bugs it
+        # was written for.
+        for field in ("dp_size", "mem_fraction_static"):
+            self.assertIn(field, written)
+
+        offenders = []
+        for rel, (tree, names, path) in sorted(candidates.items()):
+            source = path.read_text(encoding="utf-8-sig")
+            if "resolve_once(" in source or "publish(" in source:
+                continue
+            reads = sorted(
+                {
+                    f"{node.attr}:{node.lineno}"
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in names
+                    and node.attr in written
+                }
+            )
+            if reads and rel not in self._EXEMPT:
+                offenders.append(f"{rel} reads {', '.join(reads[:4])}")
+        self.assertEqual(
+            offenders,
+            [],
+            "a program builds its own record and reads what resolution decides "
+            "without resolving it, so it reads the CLI default:\n  "
+            + "\n  ".join(offenders),
+        )
+        self.assertEqual(
+            sorted(set(self._EXEMPT) - set(candidates)),
+            [],
+            "an exemption names a file that no longer builds a record",
+        )
+
+
+class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
+    """A resolved record copied with `dataclasses.replace` loses what makes it
+    resolved, and the next publish resolves it a second time -- over values it
+    already decided. The Ray paths copy a resolved record to set
+    `dist_init_addr`, which is how they reach this.
+    """
+
+    def _resolved(self):
+        config_dir = tempfile.mkdtemp(prefix="replace_resolved_")
+        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as handle:
+            json.dump(_MINI_CONFIG, handle)
+        # DP attention halves the chunked prefill size and the conservativeness
+        # is scaled: two steps that are not repeatable on their own output.
+        server_args = ServerArgs(
+            model_path=config_dir,
+            device="cuda",
+            dp_size=2,
+            tp_size=2,
+            enable_dp_attention=True,
+            random_seed=42,
+        )
+        server_args.resolve_once()
+        return server_args
+
+    def test_a_bare_replace_would_resolve_a_second_time(self):
+        """Why the helper exists. If this stops drifting, the pipeline became
+        idempotent and the helper's reason is gone -- read it again before
+        deleting either."""
+        parent = self._resolved()
+        bare = dataclasses.replace(parent, dist_init_addr="1.2.3.4:5000")
+        self.assertFalse(
+            getattr(bare, "_declarations_materialized", False),
+            "a bare replace carried the flag; then this test proves nothing",
+        )
+        bare.resolve_once()
+        self.assertEqual(
+            (bare.chunked_prefill_size, round(bare.schedule_conservativeness, 4)),
+            (
+                parent.chunked_prefill_size // 2,
+                round(parent.schedule_conservativeness * 0.3, 4),
+            ),
+            "the second pass no longer drifts; this is the drift the copy "
+            "helper exists to avoid",
+        )
+
+    def test_replace_resolved_keeps_the_parents_resolution(self):
+        parent = self._resolved()
+        copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
+        self.assertTrue(getattr(copy_, "_declarations_materialized", False))
+        drifted = {
+            field.name: (getattr(parent, field.name), getattr(copy_, field.name))
+            for field in dataclasses.fields(parent)
+            if field.name != "dist_init_addr"
+            and getattr(parent, field.name) != getattr(copy_, field.name)
+        }
+        self.assertEqual(
+            drifted,
+            {},
+            f"the copy differs from its parent beyond the change: {drifted}",
+        )
+        self.assertEqual(copy_.dist_init_addr, "1.2.3.4:5000")
+
+    def test_the_copy_carries_what_resolution_left_on_the_record(self):
+        """Not just the stash and the flag.
+
+        `get_model_config()` memoizes on the record, and that cache is filled
+        during resolution. A copy that is marked resolved but arrives without it
+        cannot fill it -- the read-only guard refuses the cache write -- so the
+        first `get_model_config()` raises. That is what killed the Ray
+        schedulers, and it is why the carry is enumerated from the instance
+        rather than from a list of names.
+        """
+        parent = self._resolved()
+        copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
+        fields = {field.name for field in dataclasses.fields(parent)}
+        missing = sorted(
+            name
+            for name in vars(parent)
+            if name not in fields and name not in vars(copy_)
+        )
+        self.assertEqual(
+            missing,
+            [],
+            f"the copy did not carry what resolution left on the record: {missing}",
+        )
+        self.assertIsNotNone(copy_.get_model_config())
+        # The containers are copies, so the copy's own declaration does not
+        # travel back into the parent.
+        self.assertEqual(
+            len(parent._resolved_overrides) + 1, len(copy_._resolved_overrides)
+        )
+
+    def test_the_change_reaches_the_bags(self):
+        """The projection reads the raw snapshot plus the declarations, so a
+        change the copy only wrote to the field would publish the parent's raw
+        value."""
+        from sglang.srt.runtime_context import (
+            get_parallel,
+            get_schedule,
+            publish,
+            reset_context,
+        )
+
+        parent = self._resolved()
+        copy_ = parent.replace_resolved("ray.test", dist_init_addr="1.2.3.4:5000")
+        self.addCleanup(reset_context)
+        reset_context()
+        publish(copy_, role="scheduler")
+        self.assertEqual(get_parallel().dist_init_addr, "1.2.3.4:5000")
+        self.assertEqual(
+            get_schedule().chunked_prefill_size,
+            parent.chunked_prefill_size,
+            "publishing the copy re-ran resolution; the bag disagrees with the "
+            "record the parent resolved",
+        )
+
+    def test_no_bare_replace_of_a_record_outside_the_helper(self):
+        """`dataclasses.replace` on a record is the helper's job now.
+
+        Derived, not listed: any `dataclasses.replace` whose first argument is
+        named for a record. The helper's own call is the positive control -- if
+        the scan stops seeing it, the scan broke rather than the tree.
+        """
+        import ast
+
+        package_root = pathlib.Path(next(iter(sglang.__path__)))
+        helper = "srt/server_args.py"
+        bare, inside_helper = [], 0
+
+        def replaces_a_record(node, record_names):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "replace"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "dataclasses"
+                and node.args
+            ):
+                return False
+            first = node.args[0]
+            name = (
+                first.id if isinstance(first, ast.Name) else getattr(first, "attr", "")
+            )
+            return name in record_names or "server_args" in name
+
+        for path in sorted(package_root.rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            except SyntaxError:
+                continue
+            rel = path.relative_to(package_root).as_posix()
+            # Inside the record's own class body `self` *is* a record; anywhere
+            # else `self` is some other dataclass, so only the name counts.
+            in_record_class = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef) and node.name == "ServerArgs"
+            ]
+            for scope, record_names in [(tree, set())] + [
+                (klass, {"self"}) for klass in in_record_class
+            ]:
+                for node in ast.walk(scope):
+                    if not replaces_a_record(node, record_names):
+                        continue
+                    if rel == helper and record_names:
+                        inside_helper += 1
+                    elif not record_names:
+                        bare.append(f"{rel}:{node.lineno}")
+        self.assertEqual(
+            inside_helper,
+            1,
+            "the scan no longer finds `replace_resolved`'s own call; it broke",
+        )
+        self.assertEqual(
+            bare,
+            [],
+            "a record is copied with a bare `dataclasses.replace`, so the copy "
+            "loses the parent's resolution and the next publish resolves it "
+            "again: " + ", ".join(bare),
+        )
 
 
 class TestTheResolutionSeamHasOneCaller(CustomTestCase):
@@ -480,8 +856,13 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
             f"ServerArgs.resolve_once; found: {callers}",
         )
 
-    def test_the_gate_is_reached_from_construction_and_from_publish(self):
-        """Both entries go through the gate, so neither can resolve twice."""
+    def test_the_gate_is_reached_from_the_launcher_and_from_publish(self):
+        """Both entries go through the gate, so neither can resolve twice.
+
+        The launcher resolves the engine's record before reading any resolved
+        value from it; every publishing process asks the gate on the way in and
+        finds nothing left to do when the record arrived resolved.
+        """
         import ast
         from pathlib import Path
 
@@ -508,11 +889,63 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
                 )
                 if called:
                     callers.append(path.relative_to(package_root).as_posix())
+        machinery = {"srt/entrypoints/engine.py", "srt/runtime_context.py"}
         self.assertEqual(
-            ["srt/runtime_context.py", "srt/server_args.py"],
+            [
+                # Program entries. Each builds a record from its own arguments
+                # and then reads effective configuration -- the CLI dispatches
+                # on flags resolution decides (the deprecated `--grpc-mode`
+                # folds into `smg_grpc_mode`), the compile tool subscripts the
+                # graph config, the benchmarks read the whole lot, and the
+                # diffusion CLI's generate subcommand reads the model path.
+                "benchmark/offline_throughput.py",
+                "benchmark/one_batch.py",
+                "benchmark/one_batch_server.py",
+                "compile_deep_gemm.py",
+                "launch_server.py",
+                "multimodal_gen/benchmarks/bench_offline_throughput.py",
+                "multimodal_gen/runtime/entrypoints/cli/generate.py",
+                # The mechanism: the launcher resolves the engine's record, and
+                # publish asks the gate on the way in.
+                "srt/entrypoints/engine.py",
+                "srt/runtime_context.py",
+            ],
             sorted(set(callers)),
             f"the resolution gate grew or lost a caller: {sorted(set(callers))}",
         )
+        # The list above is only a list; this is the rule it stands for: a
+        # caller that is not the mechanism resolves a record *it built itself*.
+        # Anything else (a worker, a manager, a library helper) was handed a
+        # record someone already resolved, or should publish, which asks the
+        # gate itself.
+        #
+        # The rule was `__name__ == "__main__"` first, and that was too narrow:
+        # the diffusion CLI's `generate` subcommand is dispatched from a
+        # subparser in another module, and it is as much a program entry as
+        # anything with a `__main__` block.
+        for caller in sorted(set(callers) - machinery):
+            source = (package_root / caller).read_text()
+            # Three spellings of "this module turned argv into the record":
+            # the dataclass itself, the CLI classmethod, and the argv helper
+            # `launch_server.py` uses -- that last hop is why matching only the
+            # first two rejected the CLI entry.
+            builds_its_own = any(
+                spelling in source
+                for spelling in (
+                    "ServerArgs(",
+                    ".from_cli_args(",
+                    "prepare_server_args(",
+                )
+            )
+            # `assertTrue`, not `assertIn`: the container is a whole module,
+            # and printing it buries the message that explains the failure.
+            self.assertTrue(
+                builds_its_own,
+                f"{caller} calls the resolution gate but does not build the "
+                "record it resolves; a record it was handed is already "
+                "resolved by whoever built it, and publish resolves what it "
+                "is handed",
+            )
 
 
 if __name__ == "__main__":

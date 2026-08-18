@@ -315,5 +315,9 @@ if __name__ == "__main__":
     parser.add_argument("--is-multimodal", action="store_true", default=False)
     args = parser.parse_args()
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
+    # Resolution decides what this program then reads (the parallel sizes, the
+    # memory fraction, a rewritten model path), and construction no longer runs
+    # it. The launcher below asks the same gate and gets a no-op.
+    server_args.resolve_once()
 
     main(args, server_args)

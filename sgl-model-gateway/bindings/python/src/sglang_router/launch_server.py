@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import copy
 import logging
 import multiprocessing as mp
 import os
@@ -87,10 +86,16 @@ def launch_server_process(
     server_args: ServerArgs, worker_port: int, dp_id: int
 ) -> mp.Process:
     """Launch a single server process with the given args and port."""
-    server_args = copy.deepcopy(server_args)
-    server_args.port = worker_port
-    server_args.base_gpu_id = dp_id * server_args.tp_size
-    server_args.dp_size = 1
+    # The parent is resolved, so this per-worker copy goes through
+    # `replace_resolved`: it keeps the parent's resolution (a deep copy would
+    # carry the read-only flag and the field writes below would be refused) and
+    # declares the three values this worker owns.
+    server_args = server_args.replace_resolved(
+        "sglang_router.launch_server_process",
+        port=worker_port,
+        base_gpu_id=dp_id * server_args.tp_size,
+        dp_size=1,
+    )
 
     proc = mp.Process(target=run_server, args=(server_args, dp_id))
     proc.start()
@@ -170,6 +175,10 @@ def main():
 
     args = parser.parse_args()
     server_args = ServerArgs.from_cli_args(args)
+    # Resolution decides what this program then reads (the parallel sizes, the
+    # memory fraction, a rewritten model path), and construction no longer runs
+    # it. The launcher below asks the same gate and gets a no-op.
+    server_args.resolve_once()
     router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
 
     # Find available ports for workers

@@ -71,4 +71,8 @@ if __name__ == "__main__":
     ]
     args = parser.parse_args(args=args)
     server_args = ServerArgs.from_cli_args(args)
+    # Resolution decides what this program then reads (the parallel sizes, the
+    # memory fraction, a rewritten model path), and construction no longer runs
+    # it. The launcher below asks the same gate and gets a no-op.
+    server_args.resolve_once()
     token_in_out_example(server_args)

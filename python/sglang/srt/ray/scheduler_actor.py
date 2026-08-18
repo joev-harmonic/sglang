@@ -47,8 +47,6 @@ class SchedulerActor:
         dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
     ):
-        import dataclasses
-
         from sglang.srt.environ import envs
         from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
         from sglang.srt.utils.numa_utils import (
@@ -56,10 +54,13 @@ class SchedulerActor:
             numa_bind_to_node,
         )
 
-        # Override dist_init_addr if provided (for multi-node)
+        # Override dist_init_addr if provided (for multi-node). Through
+        # `replace_resolved`, so the copy keeps the parent's resolution: a plain
+        # `dataclasses.replace` drops the materialization flag and this actor's
+        # publish would resolve a second time over already-resolved values.
         if dist_init_addr:
-            server_args = dataclasses.replace(
-                server_args, dist_init_addr=dist_init_addr
+            server_args = server_args.replace_resolved(
+                "ray.scheduler_actor", dist_init_addr=dist_init_addr
             )
 
         # Get actual GPU IDs from Ray runtime context

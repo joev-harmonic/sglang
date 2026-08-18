@@ -156,6 +156,10 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     args.request_id = "mocked_fake_id_for_offline_generate"
 
     server_args = ServerArgs.from_cli_args(args, unknown_args)
+    # Resolution decides what this program then reads (the parallel sizes, the
+    # memory fraction, a rewritten model path), and construction no longer runs
+    # it. The launcher below asks the same gate and gets a no-op.
+    server_args.resolve_once()
     sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
 
     sampling_params_kwargs = {}

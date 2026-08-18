@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import glob
 import importlib
@@ -3616,7 +3617,14 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
-        self.resolve_once()
+        """Construction leaves the record at what the caller asked for.
+
+        Resolution is a separate act, entered through ``resolve_once``: the
+        launcher runs it once per engine, and every publishing process asks the
+        gate on the way in. A record that is only constructed -- a fixture, a
+        config being inspected, one being handed to a subprocess that will
+        resolve it itself -- stays raw.
+        """
 
     def resolve_once(self) -> None:
         """Run the resolution pipeline, unless this record has been through it.
@@ -3633,6 +3641,59 @@ class ServerArgs:
         if getattr(self, "_declarations_materialized", False):
             return
         self._run_resolution_pipeline()
+        # The pipeline has a second exit: a dummy or absent model path returns
+        # before the materialization that normally sets the flag. The gate is
+        # about whether the handlers ran, not about how far they got, so a
+        # dummy record is resolved once too -- and the read-only guard that
+        # reads the same flag arms with it.
+        self._declarations_materialized = True
+
+    def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
+        """A copy of this record that stays resolved, and says what it changed.
+
+        `dataclasses.replace` builds a new instance, so the copy carries none of
+        what makes a record resolved: no raw snapshot, no declarations, no
+        materialization. The next publish therefore finds an unmaterialized
+        record and runs the pipeline over values it already decided -- DP
+        attention halves `chunked_prefill_size` a second time (8192 -> 4096 ->
+        2048) and the schedule conservativeness is scaled again (0.3 -> 0.09).
+        The Ray paths replace `dist_init_addr` on a resolved record, which is
+        how they hit it.
+
+        The change is appended to the stash rather than left on the field: the
+        projection reads the raw snapshot plus the declarations, so a field the
+        copy set on its own would publish the parent's raw value instead.
+        """
+        replacement = dataclasses.replace(self, **changes)
+        if not getattr(self, "_declarations_materialized", False):
+            # Not resolved yet -- there is nothing to carry, and the copy will
+            # go through the gate itself.
+            return replacement
+
+        # Everything the record holds outside its fields, enumerated from the
+        # instance rather than listed: the raw snapshot and the stash, but also
+        # what resolution memoized on the way through. `get_model_config()`
+        # caches on the record and that cache is filled during resolution, so a
+        # copy without it is a resolved record whose first `get_model_config()`
+        # hits the read-only guard -- which is how the Ray schedulers died.
+        field_names = {field.name for field in dataclasses.fields(self)}
+        for name, value in vars(self).items():
+            if name in field_names or name == "_declarations_materialized":
+                continue
+            if isinstance(value, (dict, list, set)):
+                # The copy appends to its own stash; sharing the container would
+                # write the change back into the parent.
+                value = copy.copy(value)
+            object.__setattr__(replacement, name, value)
+        stash = getattr(replacement, "_resolved_overrides", None)
+        if stash is None:
+            stash = []
+            object.__setattr__(replacement, "_resolved_overrides", stash)
+        if changes:
+            stash.append((source, dict(changes)))
+        # Last: this arms the read-only guard on the copy.
+        object.__setattr__(replacement, "_declarations_materialized", True)
+        return replacement
 
     def _declare(self, source: str, **fields: Any) -> None:
         """This record's handlers declaring their resolution writes.

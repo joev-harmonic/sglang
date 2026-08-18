@@ -989,8 +989,14 @@ def latency_test(
 
 
 def main(server_args, bench_args):
-    # Post-init write to the legacy cuda_graph_max_bs_decode field would
-    # not propagate to cuda_graph_config; update the decode phase directly.
+    # Everything below reads effective configuration -- the graph config, the
+    # parallel sizes, the tokenizer path -- and construction no longer resolves,
+    # so resolve here. The model runner asks the same gate later and gets a
+    # no-op.
+    server_args.resolve_once()
+
+    # A write to the legacy cuda_graph_max_bs_decode field would not propagate
+    # to cuda_graph_config; update the decode phase directly.
     if server_args.cuda_graph_config is not None:
         server_args.cuda_graph_config[Phase.DECODE].max_bs = max(bench_args.batch_size)
 

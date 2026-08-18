@@ -15,6 +15,13 @@ suppress_noisy_warnings()
 
 def run_server(server_args):
     """Run the server based on the gRPC flags and server_args.encoder_only."""
+    # `prepare_server_args` hands back what the operator typed; the flags this
+    # dispatches on are decided by resolution (`--grpc-mode` is folded into
+    # `smg_grpc_mode` there). Resolving here rather than reading around it
+    # keeps every read below on the effective configuration; the launcher and
+    # `publish` ask the same gate later and get a no-op.
+    server_args.resolve_once()
+
     if server_args.encoder_only:
         # For encoder disaggregation
         if server_args.smg_grpc_mode or server_args.grpc_mode:

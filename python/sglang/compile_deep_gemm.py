@@ -177,6 +177,9 @@ def compile_server_args(args, compile_args: CompileArgs) -> ServerArgs:
     args.watchdog_timeout = compile_args.timeout
     args.warmups = "compile-deep-gemm"
     server_args = ServerArgs.from_cli_args(args)
+    # `cuda_graph_config` is parsed by resolution, so it is None on a record
+    # that has only been constructed; subscripting it here used to crash.
+    server_args.resolve_once()
     server_args.cuda_graph_config[Phase.DECODE].backend = Backend.DISABLED
     server_args.cuda_graph_config[Phase.PREFILL].backend = Backend.DISABLED
     print(f"Disable CUDA Graph and Torch Compile to save time...")
