@@ -32,13 +32,7 @@ from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
-from sglang.srt.arg_groups.arg_utils import (
-    NS,
-    A,
-    Arg,
-    add_cli_args_from_dataclass,
-    field_names,
-)
+from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -3624,32 +3618,14 @@ class ServerArgs:
         self._run_resolution_pipeline()
 
     def _declare(self, source: str, **fields: Any) -> None:
-        """Record a resolution write in the declaration stash, and apply it now.
+        """This record's handlers declaring their resolution writes.
 
-        The stash is what the projection reads; the immediate write keeps this
-        handler's successors seeing the value where they read the field
-        directly, so routing a write through here changes nothing about
-        ordering. When the projection replaces field materialization, the
-        immediate write is what goes away -- the stash entry stays.
-
-        Names arrive as keyword arguments, which accept anything; a misspelled
-        one would otherwise become a new attribute that nothing ever reads, so
-        it is rejected here. This is not the model-override whitelist: that one
-        limits which fields a *registry entry* may reach, while a handler
-        writing its own field is the pipeline resolving by construction.
+        See ``arg_groups.overrides.declare_resolution``, which the hooks these
+        handlers call reach directly.
         """
-        unknown = sorted(set(fields) - field_names(type(self)))
-        if unknown:
-            raise AttributeError(f"{source}: {unknown} are not ServerArgs fields")
-        stash = getattr(self, "_resolved_overrides", None)
-        if stash is None:
-            stash = self._resolved_overrides = []
-        stash.append((source, dict(fields)))
-        for name, value in fields.items():
-            # A plain assignment, so the read-only guard applies: this is a
-            # resolution-time mechanism, and a caller reaching for it after
-            # materialization wants declare_late_resolution instead.
-            setattr(self, name, value)
+        from sglang.srt.arg_groups.overrides import declare_resolution
+
+        declare_resolution(self, source, **fields)
 
     def _run_resolution_pipeline(self):
         """
@@ -3915,8 +3891,14 @@ class ServerArgs:
         # bidirectional-attention forcing and silently produce junk output.
         if is_hrm_text and getattr(hf_config, "prefix_lm", True):
             run_post_process_pass(self, _hrm_text_attention_force)
-            self.chunked_prefill_size = -1
-            self.disable_radix_cache = True
+            self._declare(
+                "_handle_model_capability_adjustments",
+                chunked_prefill_size=-1,
+            )
+            self._declare(
+                "_handle_model_capability_adjustments",
+                disable_radix_cache=True,
+            )
             self._declare(
                 "_handle_model_capability_adjustments",
                 disable_cuda_graph=True,
@@ -3975,8 +3957,14 @@ class ServerArgs:
                 "_handle_model_capability_adjustments",
                 is_embedding=True,
             )
-            self.disable_radix_cache = True
-            self.chunked_prefill_size = -1
+            self._declare(
+                "_handle_model_capability_adjustments",
+                disable_radix_cache=True,
+            )
+            self._declare(
+                "_handle_model_capability_adjustments",
+                chunked_prefill_size=-1,
+            )
             # Submit a list-valued embeddings request atomically so BCG can
             # replay its full prefill batch instead of starting item zero
             # while the remaining texts are still being tokenized.
@@ -4043,7 +4031,10 @@ class ServerArgs:
             model_config.is_multimodal
             and not model_config.is_multimodal_chunked_prefill_supported
         ):
-            self.chunked_prefill_size = -1
+            self._declare(
+                "_handle_model_capability_adjustments",
+                chunked_prefill_size=-1,
+            )
             logger.info(
                 f"Automatically turn off --chunked-prefill-size as it is not supported for "
                 f"{hf_config.model_type}"
@@ -4510,14 +4501,20 @@ class ServerArgs:
             ),
         )
         if self.speculative_draft_model_path:
-            self.speculative_draft_model_path = _resolve_or_download(
-                self.speculative_draft_model_path,
-                revision=self.speculative_draft_model_revision or "main",
+            self._declare(
+                "_handle_modelscope_paths",
+                speculative_draft_model_path=_resolve_or_download(
+                    self.speculative_draft_model_path,
+                    revision=self.speculative_draft_model_revision or "main",
+                ),
             )
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
-            self.attention_backend = "torch_native"
+            self._declare(
+                "_handle_hpu_backends",
+                attention_backend="torch_native",
+            )
             self._declare(
                 "_handle_hpu_backends",
                 sampling_backend="pytorch",
@@ -4526,8 +4523,11 @@ class ServerArgs:
     def _handle_cpu_backends(self):
         if self.device == "cpu":
             if self.attention_backend is None:
-                self.attention_backend = (
-                    "torch_native" if is_host_cpu_arm64() else "intel_amx"
+                self._declare(
+                    "_handle_cpu_backends",
+                    attention_backend=(
+                        "torch_native" if is_host_cpu_arm64() else "intel_amx"
+                    ),
                 )
             self._declare(
                 "_handle_cpu_backends",
@@ -4551,7 +4551,10 @@ class ServerArgs:
     def _handle_mps_backends(self):
         if self.device == "mps":
             if not use_mlx():
-                self.disable_overlap_schedule = True
+                self._declare(
+                    "_handle_mps_backends",
+                    disable_overlap_schedule=True,
+                )
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":
@@ -4960,11 +4963,17 @@ class ServerArgs:
 
         if not self.disable_radix_cache:
             logger.warning("Radix cache is disabled because --enable-mis is set.")
-            self.disable_radix_cache = True
+            self._declare(
+                "_handle_multi_item_scoring",
+                disable_radix_cache=True,
+            )
 
         if self.chunked_prefill_size != -1:
             logger.warning("Chunked prefill is disabled because --enable-mis is set.")
-            self.chunked_prefill_size = -1
+            self._declare(
+                "_handle_multi_item_scoring",
+                chunked_prefill_size=-1,
+            )
 
         prefill_backend, decode_backend = self._resolved_attention_backends()
         assert prefill_backend == "flashinfer" and decode_backend == "flashinfer", (
@@ -5005,14 +5014,20 @@ class ServerArgs:
                 # T4, 4080
                 # (chunked_prefill_size 2k, max_bs 8)
                 if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 2048
+                    self._declare(
+                        "_handle_gpu_memory_settings",
+                        chunked_prefill_size=2048,
+                    )
                 if decode_cuda_graph_config.max_bs is None:
                     decode_cuda_graph_config.max_bs = 8
             elif gpu_mem < 35 * 1024:
                 # A10, 4090, 5090
                 # (chunked_prefill_size 2k, max_bs 24 if tp < 4 else 80)
                 if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 2048
+                    self._declare(
+                        "_handle_gpu_memory_settings",
+                        chunked_prefill_size=2048,
+                    )
                 if decode_cuda_graph_config.max_bs is None:
                     if self.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 24
@@ -5022,7 +5037,10 @@ class ServerArgs:
                 # A100 (40GB), L40,
                 # (chunked_prefill_size 4k, max_bs 32 if tp < 4 else 160)
                 if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 4096
+                    self._declare(
+                        "_handle_gpu_memory_settings",
+                        chunked_prefill_size=4096,
+                    )
                 if decode_cuda_graph_config.max_bs is None:
                     if self.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 32
@@ -5032,7 +5050,10 @@ class ServerArgs:
                 # H100, A100
                 # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 8192
+                    self._declare(
+                        "_handle_gpu_memory_settings",
+                        chunked_prefill_size=8192,
+                    )
                 if decode_cuda_graph_config.max_bs is None:
                     if self.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 256
@@ -5042,7 +5063,10 @@ class ServerArgs:
                 # H20, H200
                 # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 8192
+                    self._declare(
+                        "_handle_gpu_memory_settings",
+                        chunked_prefill_size=8192,
+                    )
                 if decode_cuda_graph_config.max_bs is None:
                     if self.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 256
@@ -5052,13 +5076,19 @@ class ServerArgs:
                 # B200, MI300
                 # (chunked_prefill_size 16k, max_bs 512)
                 if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 16384
+                    self._declare(
+                        "_handle_gpu_memory_settings",
+                        chunked_prefill_size=16384,
+                    )
                 if decode_cuda_graph_config.max_bs is None:
                     decode_cuda_graph_config.max_bs = 512
         else:
             # Fallback defaults when gpu_mem is None
             if self.chunked_prefill_size is None:
-                self.chunked_prefill_size = 4096
+                self._declare(
+                    "_handle_gpu_memory_settings",
+                    chunked_prefill_size=4096,
+                )
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 160
 
@@ -6180,7 +6210,10 @@ class ServerArgs:
             in (model_config.hf_config.architectures or [])
         ):
             logger.info("Radix cache is disabled for Whisper")
-            self.disable_radix_cache = True
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                disable_radix_cache=True,
+            )
 
         # Major NVIDIA platforms backends: the page-size snaps of this family
         # moved to the resolution pipeline (arg_groups/overrides.py:
@@ -6273,8 +6306,14 @@ class ServerArgs:
             logger.warning(
                 "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
             )
-            self.enable_mixed_chunk = False
-            self.disable_radix_cache = True
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                enable_mixed_chunk=False,
+            )
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                disable_radix_cache=True,
+            )
 
     def _handle_mxfp8_kv_cache_compatibility(self):
         """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
@@ -6479,7 +6518,10 @@ class ServerArgs:
             # state correctly — the unified-memory skip is no longer needed (the
             # page-major gate now allows flashinfer for linear-attn decode).
         ):
-            self.linear_attn_decode_backend = "flashinfer"
+            self._declare(
+                "_handle_linear_attn_backend",
+                linear_attn_decode_backend="flashinfer",
+            )
             logger.info(
                 "SM100+ detected with mamba-ssm-dtype=bfloat16, "
                 "defaulting --linear-attn-decode-backend to flashinfer."
@@ -6500,7 +6542,10 @@ class ServerArgs:
                     "FlashKDA is prefill-only. Use "
                     "--linear-attn-prefill-backend flashkda (decode stays on triton)."
                 )
-            self.linear_attn_decode_backend = "triton"
+            self._declare(
+                "_handle_linear_attn_backend",
+                linear_attn_decode_backend="triton",
+            )
             decode = "triton"
             logger.info(
                 "FlashKDA is prefill-only; using triton for KDA decode "
@@ -6728,11 +6773,23 @@ class ServerArgs:
             self._resolved(), "attention_backend", None
         ) in ("dsa", "dsv4")
         if use_dsa_legacy_aliases:
-            self.enable_dsa_prefill_context_parallel = True
-            self.enable_prefill_context_parallel = False
+            self._declare(
+                "_handle_legacy_cp_arguments",
+                enable_dsa_prefill_context_parallel=True,
+            )
+            self._declare(
+                "_handle_legacy_cp_arguments",
+                enable_prefill_context_parallel=False,
+            )
         else:
-            self.enable_prefill_context_parallel = True
-        self.dsa_prefill_cp_mode = mode
+            self._declare(
+                "_handle_legacy_cp_arguments",
+                enable_prefill_context_parallel=True,
+            )
+        self._declare(
+            "_handle_legacy_cp_arguments",
+            dsa_prefill_cp_mode=mode,
+        )
         self._declare(
             "_handle_legacy_cp_arguments",
             prefill_cp_mode=mode,
@@ -6870,13 +6927,19 @@ class ServerArgs:
             "_handle_dwdp",
             dp_size=self.dwdp_size,
         )
-        self.enable_dp_attention = True
+        self._declare(
+            "_handle_dwdp",
+            enable_dp_attention=True,
+        )
         self._declare("_handle_dwdp", enable_dp_attention_local_control_broadcast=True)
         self._declare(
             "_handle_dwdp",
             enable_dp_lm_head=True,
         )
-        self.moe_dense_tp_size = 1
+        self._declare(
+            "_handle_dwdp",
+            moe_dense_tp_size=1,
+        )
         self._declare(
             "_handle_dwdp",
             ep_size=self.dwdp_size,
@@ -6942,7 +7005,10 @@ class ServerArgs:
             )
             assert self.tp_size % self.dp_size == 0
             original_chunked_prefill_size = self.chunked_prefill_size
-            self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
+            self._declare(
+                "_handle_data_parallelism",
+                chunked_prefill_size=self.chunked_prefill_size // self.dp_size,
+            )
             logger.warning(
                 f"DP attention is enabled. chunked prefill size is adjusted "
                 f"from {original_chunked_prefill_size} to {self.chunked_prefill_size}."
@@ -7808,7 +7874,10 @@ class ServerArgs:
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
         ):
-            self.hicache_io_backend = "direct"
+            self._declare(
+                "_resolve_layout_io_compatibility",
+                hicache_io_backend="direct",
+            )
             logger.warning(
                 "Kernel io backend does not support page first direct layout, switching to direct io backend"
             )
@@ -7817,7 +7886,10 @@ class ServerArgs:
             self.hicache_mem_layout == "page_first"
             and self.hicache_io_backend == "direct"
         ):
-            self.hicache_mem_layout = "page_first_direct"
+            self._declare(
+                "_resolve_layout_io_compatibility",
+                hicache_mem_layout="page_first_direct",
+            )
             logger.warning(
                 "Page first layout is not supported with direct IO backend, switching to page first direct layout"
             )
@@ -7837,7 +7909,10 @@ class ServerArgs:
             # Keep current behavior for unknown backends (e.g., kernel_ascend).
             new_layout = self.hicache_mem_layout
 
-        self.hicache_mem_layout = new_layout
+        self._declare(
+            "_resolve_storage_layout_compatibility",
+            hicache_mem_layout=new_layout,
+        )
         logger.warning(
             f"Mooncake storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
@@ -7873,7 +7948,10 @@ class ServerArgs:
                     self.speculative_draft_model_path,
                     resolved_draft,
                 )
-                self.speculative_draft_model_path = resolved_draft
+                self._declare(
+                    "_resolve_hf_gguf_model_path",
+                    speculative_draft_model_path=resolved_draft,
+                )
 
     def _handle_load_format(self):
         # The quantization side of the gguf coupling moved to the pipeline
@@ -8110,8 +8188,11 @@ class ServerArgs:
             self.disaggregation_transfer_backend == "mooncake"
             and self.disaggregation_mode in ("prefill", "decode")
         ) or self.encoder_transfer_backend == "mooncake":
-            self.disaggregation_ib_device = self._validate_ib_devices(
-                self.disaggregation_ib_device
+            self._declare(
+                "_handle_encoder_disaggregation",
+                disaggregation_ib_device=self._validate_ib_devices(
+                    self.disaggregation_ib_device
+                ),
             )
 
         # Validate model type for encoder disaggregation
@@ -8637,7 +8718,10 @@ class ServerArgs:
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
                 # Currently, only certain backends support radix cache. Support for other backends is in progress
-                self.disable_radix_cache = True
+                self._declare(
+                    "_handle_deterministic_inference",
+                    disable_radix_cache=True,
+                )
                 logger.warning(
                     f"Currently radix cache is not compatible with {attention_backend} attention backend for deterministic inference. It will be supported in the future."
                 )
@@ -8656,7 +8740,10 @@ class ServerArgs:
                     # Not declared: set_default_server_args() writes this field
                     # too, through its `args` parameter, so a declaration here
                     # would be a second source for one field.
-                    self.disable_custom_all_reduce = True
+                    self._declare(
+                        "_handle_deterministic_inference",
+                        disable_custom_all_reduce=True,
+                    )
                     # should_torch_symm_mem_allreduce() takes the
                     # symmetric-memory path only below a byte threshold, so
                     # which reduce runs would follow the token count.
@@ -8916,7 +9003,10 @@ class ServerArgs:
             logger.warning(
                 "Mixed chunked prefill is disabled because of using diffusion LLM inference."
             )
-            self.enable_mixed_chunk = False
+            self._declare(
+                "_handle_dllm_inference",
+                enable_mixed_chunk=False,
+            )
 
     def _handle_asr_validation(self):
         """Validate transcription/ASR-specific server args."""
