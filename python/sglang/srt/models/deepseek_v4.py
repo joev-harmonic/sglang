@@ -37,6 +37,7 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
+    model_parallel_is_initialized,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -3233,7 +3234,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        # RL weight conversion constructs an SGLang model replica inside each
+        # trainer process without initializing SGLang's model-parallel groups.
+        # That replica only maps Megatron weights into the serving layout; it
+        # never executes a forward pass, so kernel prewarming is neither needed
+        # nor safe there.
+        if (
+            _is_npu
+            or not model_parallel_is_initialized()
+            or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        ):
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
