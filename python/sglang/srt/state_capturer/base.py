@@ -5,6 +5,10 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -52,13 +56,18 @@ class BaseDeviceCache:
 
 
 class BaseHostCache:
-    def __init__(self, num_tokens: int, num_layers: int, topk_size: int, name: str):
-        self.buffer = torch.zeros(
+    def __init__(
+        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
+    ):
+        alloc = ALLOC_MEMORY_FUNCS[device]
+        self.buffer = alloc(
             (num_tokens, num_layers, topk_size),
             dtype=torch.int32,
             device="cpu",
             pin_memory=True,
+            allocator=HostTensorAllocator(),
         )
+        self.buffer.zero_()
         self.num_tokens = num_tokens
         self.num_layers = num_layers
         self.topk_size = topk_size
@@ -115,7 +124,9 @@ class BaseTopkCapturer:
         self.num_layers = num_layers
         self.topk_size = topk_size
 
-        self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
+        self.host_cache = BaseHostCache(
+            num_tokens, num_layers, topk_size, name=name, device=device
+        )
         self.device_cache = BaseDeviceCache(
             max_batch_size,
             num_layers,
@@ -176,15 +187,12 @@ class BaseTopkCapturer:
             forward_batch, can_run_graph, cuda_graph_batch
         )
         if no_copy_to_cpu:
-            # The slice aliases the process-wide capture buffer, which the next
-            # overlapped forward rewrites. Snapshot it on the forward stream
-            # before result D2H is released to the independent copy stream.
-            slice_gpu = slice_gpu.clone()
+            # Clone before the next overlapping forward reuses these buffers.
             return TopkCaptureOutput(
-                out_cache_loc=forward_batch.out_cache_loc,
-                topk=slice_gpu,
+                out_cache_loc=forward_batch.out_cache_loc[: slice_gpu.shape[0]].clone(),
+                topk=slice_gpu.clone(),
                 host_cache=self.host_cache,
             )
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
+        out_cache_loc_cpu = forward_batch.out_cache_loc[: slice_gpu.shape[0]].cpu()
         self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
         return None

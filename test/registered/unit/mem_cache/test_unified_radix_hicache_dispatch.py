@@ -17,8 +17,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _SwaStrategy,
     register_stack_strategy,
 )
-from sglang.srt.mem_cache.unified_cache_components import ComponentType
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
