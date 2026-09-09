@@ -1064,6 +1064,9 @@ def test_qsa_exact_topk_respects_packed_windows_and_short_rows():
     assert (actual[2] == -1).all()
     assert (actual[0] == -1).sum() == 1
     assert (actual[1] == -1).sum() == 2
+    for row in actual:
+        valid = (row >= 0).tolist()
+        assert valid == sorted(valid, reverse=True)
 
 
 def test_qsa_exact_topk_pads_when_logits_are_narrower_than_topk():
