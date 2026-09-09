@@ -613,6 +613,11 @@ class Envs:
     # off some TTFT-metric accuracy for less IPC overhead.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
+    # Diagnostic escape hatch for QSA prefill correctness investigations.
+    # The Torch implementation is much slower, but is the reference against
+    # which the optimized TileLang kernel is validated.
+    SGLANG_QSA_FORCE_TORCH_PREFILL = EnvBool(False)
+
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
     # ===================================================================

@@ -5,6 +5,7 @@ import math
 from typing import Optional
 
 import torch
+from sglang.srt.environ import envs
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -403,7 +404,11 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    if q.is_cuda and HAS_TILELANG:
+    if (
+        q.is_cuda
+        and HAS_TILELANG
+        and not envs.SGLANG_QSA_FORCE_TORCH_PREFILL.get()
+    ):
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 

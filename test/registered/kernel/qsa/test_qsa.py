@@ -5,8 +5,10 @@ import pytest
 import torch
 from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.qsa import dsa_indexer as dsa_indexer_module
+from sglang.srt.layers.attention.qsa import mqa as qsa_mqa_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
@@ -1044,6 +1046,24 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
         (columns < starts[:, None]) | (columns >= ends[:, None]), -float("inf")
     )
     torch.testing.assert_close(actual, expected)
+
+
+def test_qsa_force_torch_prefill_bypasses_tilelang(monkeypatch):
+    torch_result = object()
+    monkeypatch.setattr(qsa_mqa_module, "HAS_TILELANG", True)
+    monkeypatch.setattr(
+        qsa_mqa_module, "tilelang_qsa_mqa_prefill", lambda *args: pytest.fail()
+    )
+    monkeypatch.setattr(
+        qsa_mqa_module, "torch_qsa_mqa_prefill", lambda *args: torch_result
+    )
+
+    with envs.SGLANG_QSA_FORCE_TORCH_PREFILL.override(True):
+        actual = qsa_mqa_module.qsa_mqa_prefill(
+            SimpleNamespace(is_cuda=True), None, None, None
+        )
+
+    assert actual is torch_result
 
 
 def test_qsa_exact_topk_respects_packed_windows_and_short_rows():
