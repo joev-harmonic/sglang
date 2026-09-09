@@ -1059,14 +1059,21 @@ def test_qsa_exact_topk_respects_packed_windows_and_short_rows():
 
     actual = qsa_exact_topk(logits, starts, ends, topk=4)
 
+    raw = torch.topk(logits, 4, dim=-1, sorted=False).indices
     assert set(actual[0][actual[0] >= 0].tolist()) == {0, 1, 2}
     assert set(actual[1][actual[1] >= 0].tolist()) == {0, 1}
     assert (actual[2] == -1).all()
     assert (actual[0] == -1).sum() == 1
     assert (actual[1] == -1).sum() == 2
-    for row in actual:
+    for row_index, row in enumerate(actual):
         valid = (row >= 0).tolist()
         assert valid == sorted(valid, reverse=True)
+        raw_relative = raw[row_index] - starts[row_index]
+        raw_valid = raw_relative[
+            (raw[row_index] >= starts[row_index])
+            & (raw[row_index] < ends[row_index])
+        ]
+        torch.testing.assert_close(row[: raw_valid.numel()], raw_valid.to(torch.int32))
 
 
 def test_qsa_exact_topk_pads_when_logits_are_narrower_than_topk():
