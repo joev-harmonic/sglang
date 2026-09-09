@@ -98,13 +98,15 @@ def qsa_exact_topk(
 
     starts = row_starts.to(device=logits.device, dtype=torch.int64).reshape(-1, 1)
     ends = row_ends.to(device=logits.device, dtype=torch.int64).reshape(-1, 1)
-    # The expansion kernel requires valid blocks to precede ``-1`` padding.
-    # Sorting keeps every finite in-window logit ahead of the masked ``-inf``
-    # entries when a row has fewer than ``topk`` visible blocks.
-    absolute = torch.topk(logits, width, dim=-1, sorted=True).indices
+    absolute = torch.topk(logits, width, dim=-1, sorted=False).indices
     valid = (absolute >= starts) & (absolute < ends)
     relative = (absolute - starts).to(torch.int32)
-    output[:, :width] = torch.where(valid, relative, -1)
+    relative = torch.where(valid, relative, -1)
+    # The expansion kernel requires valid blocks to precede ``-1`` padding.
+    # Keep torch.topk's existing order for the valid set so this compaction does
+    # not change the floating-point accumulation order for full-width rows.
+    order = torch.argsort((~valid).to(torch.int8), dim=-1, stable=True)
+    output[:, :width] = relative.gather(1, order)
     return output
 
 
