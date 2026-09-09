@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
-
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
+    qsa_exact_topk,
     qsa_fast_topk,
 )
 from sglang.srt.layers.attention.qsa.metadata import (
@@ -460,7 +460,10 @@ class QSAIndexer(MultiPlatformOp):
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
                 )
-                block_indices = qsa_fast_topk(
+                # Use an exact selector during prefill.  The JIT radix selector
+                # clips a coarse threshold bucket to a fixed candidate buffer;
+                # concentrated long-context QSA logits can exceed that bound.
+                block_indices = qsa_exact_topk(
                     logits,
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],

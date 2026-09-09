@@ -3,7 +3,6 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
@@ -11,7 +10,7 @@ from sglang.srt.layers.attention.qsa import dsa_indexer as dsa_indexer_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
-    qsa_fast_topk,
+    qsa_exact_topk,
     qsa_sparse_attention,
     torch_expand_qsa_block_indices,
     triton_expand_qsa_block_indices,
@@ -1047,6 +1046,37 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
     torch.testing.assert_close(actual, expected)
 
 
+def test_qsa_exact_topk_respects_packed_windows_and_short_rows():
+    logits = torch.tensor(
+        [
+            [-float("inf"), 4.0, 1.0, 3.0, -float("inf"), -float("inf")],
+            [-float("inf"), -float("inf"), 8.0, -2.0, -float("inf"), -float("inf")],
+            [-float("inf")] * 6,
+        ]
+    )
+    starts = torch.tensor([1, 2, 5], dtype=torch.int32)
+    ends = torch.tensor([4, 4, 5], dtype=torch.int32)
+
+    actual = qsa_exact_topk(logits, starts, ends, topk=4)
+
+    assert set(actual[0][actual[0] >= 0].tolist()) == {0, 1, 2}
+    assert set(actual[1][actual[1] >= 0].tolist()) == {0, 1}
+    assert (actual[2] == -1).all()
+    assert (actual[0] == -1).sum() == 1
+    assert (actual[1] == -1).sum() == 2
+
+
+def test_qsa_exact_topk_pads_when_logits_are_narrower_than_topk():
+    logits = torch.tensor([[3.0, 2.0]])
+    starts = torch.tensor([0], dtype=torch.int32)
+    ends = torch.tensor([2], dtype=torch.int32)
+
+    actual = qsa_exact_topk(logits, starts, ends, topk=4)
+
+    assert set(actual[0, :2].tolist()) == {0, 1}
+    assert (actual[0, 2:] == -1).all()
+
+
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4
@@ -1074,7 +1104,7 @@ def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     )
 
     logits = qsa_mqa_prefill(q, k, starts, ends)
-    blocks = qsa_fast_topk(logits, starts, ends, topk=indexer.block_topk)
+    blocks = qsa_exact_topk(logits, starts, ends, topk=indexer.block_topk)
     expected = expand_qsa_block_indices(
         blocks,
         positions,
