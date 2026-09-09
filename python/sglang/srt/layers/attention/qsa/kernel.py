@@ -68,6 +68,43 @@ def qsa_fast_topk(
     return output
 
 
+def qsa_exact_topk(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """Select exact per-row top-k indices from already-masked QSA logits.
+
+    QSA prefill produces a packed ``[rows, keys]`` matrix with entries outside
+    each row's ``[start, end)`` window set to ``-inf``.  Running ``torch.topk``
+    over the full row is therefore exact while avoiding the bounded candidate
+    buffer used by the radix-select fast path.  Returned indices are relative
+    to each row start and short rows are padded with ``-1``.
+    """
+
+    if logits.ndim != 2:
+        raise ValueError(f"QSA logits must be two-dimensional, got {logits.shape}")
+    if row_starts.numel() != logits.shape[0] or row_ends.numel() != logits.shape[0]:
+        raise ValueError("QSA row windows must match the number of logits rows")
+    if topk <= 0:
+        raise ValueError(f"QSA top-k must be positive, got {topk}")
+
+    rows, columns = logits.shape
+    output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    width = min(topk, columns)
+    if rows == 0 or width == 0:
+        return output
+
+    starts = row_starts.to(device=logits.device, dtype=torch.int64).reshape(-1, 1)
+    ends = row_ends.to(device=logits.device, dtype=torch.int64).reshape(-1, 1)
+    absolute = torch.topk(logits, width, dim=-1, sorted=False).indices
+    valid = (absolute >= starts) & (absolute < ends)
+    relative = (absolute - starts).to(torch.int32)
+    output[:, :width] = torch.where(valid, relative, -1)
+    return output
+
+
 def torch_expand_qsa_block_indices(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
@@ -324,9 +361,10 @@ def qsa_sparse_attention_reference(
 __all__ = [
     "average_pool_qsa_keys",
     "expand_qsa_block_indices",
-    "torch_expand_qsa_block_indices",
-    "triton_expand_qsa_block_indices",
+    "qsa_exact_topk",
     "qsa_fast_topk",
     "qsa_sparse_attention",
     "qsa_sparse_attention_reference",
+    "torch_expand_qsa_block_indices",
+    "triton_expand_qsa_block_indices",
 ]
