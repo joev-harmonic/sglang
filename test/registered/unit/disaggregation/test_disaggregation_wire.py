@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     get_dsv4_c128_state_indices,
+    get_qsa_pending_state_indices,
     setup_state_kv_args,
     should_send_replicated_state,
 )
@@ -146,6 +147,14 @@ class TestDisaggregationWire(unittest.TestCase):
 
 
 class TestQwen4StateWire(unittest.TestCase):
+    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
+
+        np.testing.assert_array_equal(
+            get_qsa_pending_state_indices(req),
+            np.array([7], dtype=np.int32),
+        )
+
     def test_qsa_registers_request_ring_and_page_state_separately(self):
         pool = object.__new__(QSATokenToKVPool)
         pool.full_kv_pool = object()

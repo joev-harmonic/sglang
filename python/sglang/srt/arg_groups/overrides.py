@@ -1360,6 +1360,19 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     neither that nor --disable-radix-cache holds (the QSA pool then fails
     fast at boot).
     """
+    if (
+        server_args.disaggregation_mode != "null"
+        and server_args.disaggregation_transfer_backend == "mori"
+        and server_args.pp_size > 1
+    ):
+        raise ValueError(
+            "Qwen4-Exp PD with MORI requires --pp-size 1; MORI does not yet "
+            "exchange the global QSA layer metadata needed to pair compact "
+            "state descriptors across pipeline stages."
+        )
+    if server_args.enable_unified_memory:
+        raise ValueError("Qwen4-Exp does not support --enable-unified-memory yet")
+
     overrides: Dict[str, Any] = {}
     if server_args.ple_offload_embedding is None:
         import torch
