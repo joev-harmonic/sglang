@@ -126,13 +126,15 @@ def _router_triton_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    # prefetch bias before PDL wait
+    # PDL may start this grid before prior kernel stores are visible. Bias can
+    # be produced by a preceding cast or fill kernel, so wait before loading
+    # either bias or scores.
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(
         tl.float32
     )  # [BLOCK_N]
-
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
 
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = mask_m[:, None] & mask_n[None, :]
