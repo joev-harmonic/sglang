@@ -193,13 +193,14 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         _flashinfer_pr4266_splitk_tactic = SplitKTactic
         _flashinfer_pr4266_run_splitk_dense = run_splitk_dense
         _enable_bf16_splitk_gemm = True
-        _precompile_splitk_tactics()
 
     _BF16_GEMM_BACKEND = backend
 
 
-def _precompile_splitk_tactics() -> None:
+def precompile_splitk_tactics() -> bool:
     """JIT-compile every allowlisted tactic before CUDA graph capture."""
+    if not _enable_bf16_splitk_gemm:
+        return False
     device = torch.cuda.current_device()
     for (m, n, k), tactic_args in _FLASHINFER_PR4266_TUNED_TACTICS.items():
         a = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
@@ -209,6 +210,7 @@ def _precompile_splitk_tactics() -> None:
             a, w.T, None, out, True, _flashinfer_pr4266_splitk_tactic(*tactic_args)
         )
     torch.cuda.synchronize()
+    return True
 
 
 def _flashinfer_pr4266_bf16_gemm(
