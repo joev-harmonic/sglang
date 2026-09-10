@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
+    mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (

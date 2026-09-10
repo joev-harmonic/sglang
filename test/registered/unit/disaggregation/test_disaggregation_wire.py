@@ -147,8 +147,8 @@ class TestDisaggregationWire(unittest.TestCase):
 
 
 class TestQwen4StateWire(unittest.TestCase):
-    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
-        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
+    def test_qsa_pending_payload_uses_request_pool_row(self):
+        req = SimpleNamespace(req_pool_idx=7)
 
         np.testing.assert_array_equal(
             get_qsa_pending_state_indices(req),
