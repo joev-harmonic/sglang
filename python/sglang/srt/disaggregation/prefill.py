@@ -1262,7 +1262,7 @@ class SchedulerDisaggregationPrefillMixin:
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.QSA_PENDING: _qsa_pending_payload,
-                StateType.QSA_COMPRESSED: _full_kv_pages_payload,
+                StateType.QSA_COMPRESSED: _dsa_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _dsa_payload,
                 StateType.MINIMAX_INDEX_K: _dsa_payload,
