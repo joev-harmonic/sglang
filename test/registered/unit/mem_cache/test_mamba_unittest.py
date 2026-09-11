@@ -598,12 +598,36 @@ class TestMamba(unittest.TestCase):
         self.assertEqual(match.last_device_node.mamba_value.item(), tracked_slot)
         self.assertNotEqual(match.last_device_node.mamba_value.item(), live_slot)
 
+    def test_chunked_radix_insert_can_be_deferred(self):
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator(disable_chunked_radix_insert=True)
+        )
+        tokens = [1, 2, 3, 4]
+        req = make_dummy_req()
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.set_extend_range(0, len(tokens))
+        kv_indices = allocator.alloc(len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        available_mamba_slots = req_to_token_pool.mamba_allocator.available_size()
+
+        tree.cache_unfinished_req(req, chunked=True)
+
+        self.assertTrue(torch.equal(req.prefix_indices, kv_indices.to(torch.int64)))
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertEqual(tree.total_size(), (0, 0))
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(),
+            available_mamba_slots,
+        )
+
     def _setup_tree_and_allocator(
         self,
         enable_kv_cache_events=False,
         *,
         enable_mamba_extra_buffer=False,
         is_eagle=False,
+        disable_chunked_radix_insert=False,
     ):
         """Helper to create a MambaRadixCache with allocator for testing."""
         server_args = ServerArgs(model_path="dummy", page_size=1)
@@ -678,6 +702,7 @@ class TestMamba(unittest.TestCase):
             enable_kv_cache_events=enable_kv_cache_events,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             is_eagle=is_eagle,
+            disable_chunked_radix_insert=disable_chunked_radix_insert,
         )
         tree = MambaRadixCache(params=params)
 
