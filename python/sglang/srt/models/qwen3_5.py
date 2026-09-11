@@ -122,6 +122,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
@@ -722,12 +723,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
+        probe_context = (
+            f"Qwen3.5 GDN inputs, layer={self.layer_id}, "
+            f"forward_mode={forward_batch.forward_mode}"
+        )
+        for name, tensor in (("qkv", mixed_qkv), ("a", a), ("b", b), ("z", z)):
+            maybe_detect_nan(tensor, f"{probe_context}, tensor={name}")
+            maybe_detect_inf(tensor, f"{probe_context}, tensor={name}")
+
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
         )
+        probe_context = (
+            f"Qwen3.5 GDN attention output, layer={self.layer_id}, "
+            f"forward_mode={forward_batch.forward_mode}"
+        )
+        maybe_detect_nan(core_attn_out, probe_context)
+        maybe_detect_inf(core_attn_out, probe_context)
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
@@ -748,6 +763,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         output, _ = self.out_proj(core_attn_out)
+        probe_context = (
+            f"Qwen3.5 GDN projection output, layer={self.layer_id}, "
+            f"forward_mode={forward_batch.forward_mode}"
+        )
+        maybe_detect_nan(output, probe_context)
+        maybe_detect_inf(output, probe_context)
         return output
 
 
@@ -1236,8 +1257,21 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        probe_context = (
+            f"Qwen3.5 full attention inputs, layer={self.layer_id}, "
+            f"forward_mode={forward_batch.forward_mode}"
+        )
+        for name, tensor in (("q", q), ("k", k), ("v", v), ("gate", gate)):
+            maybe_detect_nan(tensor, f"{probe_context}, tensor={name}")
+            maybe_detect_inf(tensor, f"{probe_context}, tensor={name}")
 
         attn_output = self.attn(q, k, v, forward_batch)
+        probe_context = (
+            f"Qwen3.5 full attention output, layer={self.layer_id}, "
+            f"forward_mode={forward_batch.forward_mode}"
+        )
+        maybe_detect_nan(attn_output, probe_context)
+        maybe_detect_inf(attn_output, probe_context)
 
         if self.attn_output_gate:
             if not _is_npu:
@@ -1247,6 +1281,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 attn_output.mul_(torch.sigmoid(gate_val))
 
         output, _ = self.o_proj(attn_output)
+        probe_context = (
+            f"Qwen3.5 full attention projection output, layer={self.layer_id}, "
+            f"forward_mode={forward_batch.forward_mode}"
+        )
+        maybe_detect_nan(output, probe_context)
+        maybe_detect_inf(output, probe_context)
         return output
 
     def forward(

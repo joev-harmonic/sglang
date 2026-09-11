@@ -15,7 +15,6 @@ from typing import Dict, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     QSA_VARIANT_COMPRESSED,
@@ -38,6 +37,11 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils.async_probe import (
+    maybe_assert_async,
+    maybe_detect_inf,
+    maybe_detect_nan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1459,6 +1463,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         qwen_sparse_valid_counts_triton(
             sequence_lens, topk_indices, valid_counts, batch, topk
         )
+        maybe_assert_async(
+            (valid_counts > 0).all(),
+            f"QSA TRTLLM decode has an empty sparse row, layer={layer.layer_id}",
+        )
+        maybe_assert_async(
+            (valid_counts <= topk).all(),
+            f"QSA TRTLLM decode valid count exceeds top-k, layer={layer.layer_id}",
+        )
         cu_strided, block_tables = self._get_trtllm_sparse_tables(
             batch, pages_per_row, page, device
         )
@@ -1516,6 +1528,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             bmm1_scale=layer.scaling,
             bmm2_scale=1.0,
         )
+        probe_context = f"QSA TRTLLM sparse output, layer={layer.layer_id}"
+        maybe_detect_nan(output, probe_context)
+        maybe_detect_inf(output, probe_context)
         return output.reshape(q.shape[0], -1)
 
     def forward_decode(
@@ -1590,6 +1605,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
         )
+        maybe_assert_async(
+            (valid_counts > 0).all(),
+            f"QSA FA2 decode has an empty sparse row, layer={layer.layer_id}",
+        )
+        maybe_assert_async(
+            (valid_counts <= topk).all(),
+            f"QSA FA2 decode valid count exceeds top-k, layer={layer.layer_id}",
+        )
         scratch_capacity = (
             self._cuda_graph_max_tokens * topk
             if metadata.is_cuda_graph
@@ -1630,6 +1653,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             softmax_scale=layer.scaling,
             causal=True,
         )
+        probe_context = f"QSA FA2 sparse output, layer={layer.layer_id}"
+        maybe_detect_nan(output, probe_context)
+        maybe_detect_inf(output, probe_context)
         return output.reshape(q.shape[0], -1)
 
 
