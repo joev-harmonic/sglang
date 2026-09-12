@@ -125,6 +125,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 100
+        queue.req_to_token_pool.available_prealloc_size.return_value = 100
         queue.req_to_token_pool.req_to_token = torch.arange(
             8 * 16, dtype=torch.int64
         ).reshape(8, 16)
@@ -193,6 +194,23 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
                 "high",
             ],
         )
+        self.assertEqual(failed, [])
+
+    def test_prealloc_queue_stops_when_transfer_reservation_is_full(self):
+        reqs = [
+            self._new_decode_req("first", 2),
+            self._new_decode_req("second", 1),
+        ]
+        queue = self._new_queue(reqs)
+        queue.req_to_token_pool.available_prealloc_size.side_effect = [1, 0]
+
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(
+            [decode_req.req.rid for decode_req in preallocated], ["first"]
+        )
+        self.assertEqual([decode_req.req.rid for decode_req in queue.queue], ["second"])
         self.assertEqual(failed, [])
 
     def test_failed_request_indices_stay_valid_after_priority_sort(self):

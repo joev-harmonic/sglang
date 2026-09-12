@@ -214,6 +214,21 @@ class DecodeReqToTokenPool(ReqToTokenPool):
     def available_size(self):
         return len(self.free_slots)
 
+    def available_prealloc_size(self, running_reqs: List[Req]) -> int:
+        """Return slots available without consuming runnable-request capacity."""
+        if self.pre_alloc_size <= 0:
+            # Preserve the existing shared-pool behavior when no dedicated
+            # preallocation capacity was requested.
+            return self.available_size()
+
+        allocated_size = self.size + self.pre_alloc_size - self.available_size()
+        running_size = sum(req.req_pool_idx is not None for req in running_reqs)
+        non_running_size = max(0, allocated_size - running_size)
+        return min(
+            self.available_size(),
+            max(0, self.pre_alloc_size - non_running_size),
+        )
+
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
@@ -1087,7 +1102,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.waiting_for_input:
                 continue
 
-            if self.req_to_token_pool.available_size() <= 0:
+            if (
+                self.req_to_token_pool.available_prealloc_size(
+                    self.scheduler.running_batch.reqs
+                )
+                <= 0
+            ):
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:

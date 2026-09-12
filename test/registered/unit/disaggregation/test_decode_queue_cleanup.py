@@ -7,6 +7,7 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    DecodeReqToTokenPool,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
@@ -34,6 +35,37 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_extra_slots_reserve_runnable_request_capacity(self):
+        pool = DecodeReqToTokenPool.__new__(DecodeReqToTokenPool)
+        pool.size = 210
+        pool.pre_alloc_size = 64
+        pool._alloc_size = 275
+
+        pool.free_slots = list(range(274))
+        self.assertEqual(pool.available_prealloc_size([]), 64)
+
+        # 260 allocated slots with 200 runnable requests leaves 60 occupied by
+        # non-running requests, so only four more transfers may be admitted.
+        pool.free_slots = list(range(14))
+        running_reqs = [SimpleNamespace(req_pool_idx=i) for i in range(200)]
+        self.assertEqual(pool.available_prealloc_size(running_reqs), 4)
+
+        # Once non-running requests consume the reservation, the 210 base
+        # slots remain available to become runnable instead of admitting more
+        # transfers into them.
+        pool.free_slots = []
+        running_reqs = [SimpleNamespace(req_pool_idx=i) for i in range(90)]
+        self.assertEqual(pool.available_prealloc_size(running_reqs), 0)
+
+    def test_zero_extra_slots_preserves_shared_pool_behavior(self):
+        pool = DecodeReqToTokenPool.__new__(DecodeReqToTokenPool)
+        pool.size = 210
+        pool.pre_alloc_size = 0
+        pool._alloc_size = 211
+        pool.free_slots = list(range(100))
+
+        self.assertEqual(pool.available_prealloc_size([]), 100)
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.
