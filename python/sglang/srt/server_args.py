@@ -7027,10 +7027,11 @@ class ServerArgs:
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
             assert resolved_view(self).moe_runner_backend in [
+                "deep_gemm",
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
                 "flashinfer_trtllm_routed",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
+            ], "Flashinfer MoE A2A is only supported with deep_gemm, flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
 
         if a2a_backend == "mori":
             if self.deepep_mode == "auto":

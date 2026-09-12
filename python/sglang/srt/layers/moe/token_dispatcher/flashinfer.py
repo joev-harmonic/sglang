@@ -9,6 +9,7 @@ from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
+    get_is_extend_in_batch,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe.token_dispatcher import (
@@ -21,13 +22,18 @@ from sglang.srt.layers.moe.token_dispatcher import (
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
     TorchDistributedCommBackend,
 )
+from sglang.srt.layers.moe.token_dispatcher.standard import (
+    StandardCombineInput,
+    StandardDispatcher,
+    StandardDispatchOutput,
+)
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKOutput,
     TopKOutputChecker,
 )
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
-from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 try:
@@ -45,6 +51,27 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+
+
+def _max_tokens_per_scattered_source(
+    dp_global_num_tokens: list[int], attn_tp_size: int
+) -> int:
+    assert attn_tp_size > 0
+    return (max(dp_global_num_tokens) + attn_tp_size - 1) // attn_tp_size
+
+
+def _scattered_source_token_counts(
+    dp_global_num_tokens: list[int], attn_tp_size: int
+) -> list[int]:
+    assert attn_tp_size > 0
+    counts = []
+    for num_tokens in dp_global_num_tokens:
+        base, remainder = divmod(num_tokens, attn_tp_size)
+        counts.extend(
+            base + int(attn_tp_rank < remainder)
+            for attn_tp_rank in range(attn_tp_size)
+        )
+    return counts
 
 
 class FlashinferDispatchOutput(NamedTuple):
@@ -88,6 +115,7 @@ class FlashinferDispatcher(BaseDispatcher):
         num_local_experts: int = None,  # Unused
         hidden_size: int = None,
         params_dtype: torch.dtype = None,  # Unused
+        moe_runner_config=None,
     ):
         super().__init__()
         if not use_flashinfer:
@@ -102,13 +130,28 @@ class FlashinferDispatcher(BaseDispatcher):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
+        runner_backend = get_moe_runner_backend()
         self.invalid_token_expert_id = (
             -1
-            if get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            if (
+                runner_backend.is_deep_gemm()
+                or runner_backend.is_flashinfer_trtllm()
+                or runner_backend.is_flashinfer_trtllm_routed()
+            )
             else self.num_experts
         )
         # TODO: Can other moe runners use payload_in_workspace too?
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        if moe_runner_config is None:
+            from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+            moe_runner_config = MoeRunnerConfig(
+                num_experts=num_experts,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                top_k=router_topk,
+            )
+        self.prefill_dispatcher = StandardDispatcher(moe_runner_config)
 
         # FlashInfer sizes the workspace from the maximum dispatched tokens per
         # EP rank. See FlashInfer's moe_a2a_get_workspace_size_per_rank(),
@@ -176,10 +219,84 @@ class FlashinferDispatcher(BaseDispatcher):
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
+    def set_quant_config(self, quant_config: dict) -> None:
+        super().set_quant_config(quant_config)
+        self.prefill_dispatcher.set_quant_config(quant_config)
+
+    def _dispatch_prefill_allgather(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> StandardDispatchOutput:
+        # Eager extend can overlap another stream. Use BF16 all-gatherv instead
+        # of sharing the pure-decode A2A signal state across streams.
+        if hidden_states.dtype != torch.bfloat16:
+            raise TypeError(
+                "FlashInfer WideEP prefill AG requires BF16 hidden states, got "
+                f"{hidden_states.dtype}."
+            )
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            topk_output = topk_output.to_standard()
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            raise TypeError(
+                "FlashInfer WideEP prefill AG requires materialized top-k "
+                f"routing, got {type(topk_output).__name__}."
+            )
+
+        dp_global = get_dp_global_num_tokens()
+        if dp_global is None:
+            source_sizes = [hidden_states.shape[0]] * self.ep_size
+        else:
+            source_sizes = _scattered_source_token_counts(
+                dp_global, get_parallel().attn_tp_size
+            )
+        if len(source_sizes) != self.ep_size:
+            raise RuntimeError(
+                "FlashInfer WideEP prefill AG source geometry does not match "
+                f"EP: len(source_sizes)={len(source_sizes)}, ep_size={self.ep_size}."
+            )
+        if source_sizes[self.ep_rank] != hidden_states.shape[0]:
+            raise RuntimeError(
+                "FlashInfer WideEP prefill AG local source geometry mismatch: "
+                f"source_sizes[{self.ep_rank}]={source_sizes[self.ep_rank]} != "
+                f"hidden_states.shape[0]={hidden_states.shape[0]}."
+            )
+
+        topk_ids = topk_output.topk_ids.to(torch.int32)
+        hidden_states, topk_ids, topk_weights = get_parallel().tp_group.all_gatherv(
+            [hidden_states, topk_ids, topk_output.topk_weights],
+            sizes=source_sizes,
+        )
+        self.prefill_source_sizes = source_sizes
+        return self.prefill_dispatcher.dispatch(
+            hidden_states,
+            StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
+        )
+
     @debug_kernel_api
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
-    ) -> FlashinferDispatchOutput:
+    ) -> FlashinferDispatchOutput | StandardDispatchOutput:
+        if get_is_extend_in_batch():
+            return self._dispatch_prefill_allgather(hidden_states, topk_output)
+
+        # Blockwise FP8 runners quantize immediately before GEMM, so their
+        # FlashInfer dispatch/combine payload stays BF16.
+        runner_backend = get_moe_runner_backend()
+        weight_dtype = self.quant_config.get("weight_dtype")
+        uses_bf16_fp8_payload = weight_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ) and (
+            runner_backend.is_deep_gemm()
+            or runner_backend.is_flashinfer_trtllm()
+            or runner_backend.is_flashinfer_trtllm_routed()
+        )
+        if uses_bf16_fp8_payload and hidden_states.dtype != torch.bfloat16:
+            raise TypeError(
+                "FlashInfer A2A with an FP8 DeepGEMM/TRT-LLM MoE runner "
+                "requires BF16 dispatch and combine payloads, but received "
+                f"{hidden_states.dtype}."
+            )
+
         output_dtype = hidden_states.dtype
         x = hidden_states
         x_sf = None
@@ -237,7 +354,9 @@ class FlashinferDispatcher(BaseDispatcher):
         dp_global = get_dp_global_num_tokens()
         if dp_global is not None and len(dp_global) > 1:
             # Case 1
-            self.runtime_max_tokens_per_rank = max(dp_global)
+            self.runtime_max_tokens_per_rank = _max_tokens_per_scattered_source(
+                dp_global, get_parallel().attn_tp_size
+            )
         else:
             # Case 2. Guard against the #30242 failure mode: DP attention must
             # never land here with ep_size > 1, because there x.shape[0] differs
@@ -251,6 +370,13 @@ class FlashinferDispatcher(BaseDispatcher):
                 "runtime_max_tokens_per_rank would not be rank-invariant."
             )
             self.runtime_max_tokens_per_rank = x.shape[0]
+
+        assert self.runtime_max_tokens_per_rank <= self.max_num_tokens, (
+            "FlashInfer A2A runtime token geometry exceeds its fixed workspace: "
+            f"runtime_max_tokens_per_rank={self.runtime_max_tokens_per_rank} > "
+            f"max_num_tokens={self.max_num_tokens}. Increase "
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
+        )
 
         # The recv buffer reserves runtime_max_tokens_per_rank slots for THIS
         # rank, so it must cover this rank's own tokens. This holds in both cases
@@ -301,8 +427,37 @@ class FlashinferDispatcher(BaseDispatcher):
         )
 
     @debug_kernel_api
-    def combine(self, combine_input: FlashinferCombineInput) -> torch.Tensor:
+    def combine(
+        self, combine_input: FlashinferCombineInput | StandardCombineInput
+    ) -> torch.Tensor:
         hidden_states = combine_input.hidden_states
+        if combine_input.format == CombineInputFormat.STANDARD:
+            if hidden_states.dtype != torch.bfloat16:
+                raise TypeError(
+                    "FlashInfer WideEP prefill RS requires BF16 expert output, "
+                    f"got {hidden_states.dtype}."
+                )
+            hidden_states = get_parallel().tp_group.reduce_scatterv(
+                hidden_states, sizes=self.prefill_source_sizes
+            )
+            del self.prefill_source_sizes
+            return hidden_states
+
+        weight_dtype = self.quant_config.get("weight_dtype")
+        runner_backend = get_moe_runner_backend()
+        if (
+            weight_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and (
+                runner_backend.is_deep_gemm()
+                or runner_backend.is_flashinfer_trtllm()
+                or runner_backend.is_flashinfer_trtllm_routed()
+            )
+            and hidden_states.dtype != torch.bfloat16
+        ):
+            raise TypeError(
+                "FlashInfer A2A FP8 MoE combine payload must be BF16, but "
+                f"received {hidden_states.dtype}."
+            )
         output_hidden_size = hidden_states.shape[-1]
         hidden_states = self.moe_a2a.combine(
             hidden_states.view(

@@ -49,6 +49,9 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -810,6 +813,7 @@ def pre_permute_standard_to_deep_gemm(
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
+    expert_start: int = 0,
 ) -> DeepGemmRunnerInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import (
         ep_scatter,
@@ -845,6 +849,7 @@ def pre_permute_standard_to_deep_gemm(
                 quant_info.block_shape,
                 output_dtype=output_dtype,
                 use_mxfp8=quant_info.use_mxfp8,
+                expert_start=expert_start,
             )
         )
         # Use the global expert count because expected_m is a tuning hint, not
@@ -886,7 +891,7 @@ def pre_permute_standard_to_deep_gemm(
     all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
 
     tokens_per_expert, unused_masked_dst = fused_moe_dispatch_index(
-        topk_ids, num_experts, 1
+        topk_ids, num_experts, 1, expert_start=expert_start
     )
     dispose_tensor(unused_masked_dst)
     valid_tokens_per_expert = tokens_per_expert
@@ -966,6 +971,7 @@ def pre_permute_standard_to_deep_gemm(
         src2dst,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         quant_block_size=(quant_info.block_shape[1] if quant_info.block_shape else 128),
+        expert_start=expert_start,
     )
     if packed_input_source is not hidden_states:
         dispose_tensor(packed_input_source)
@@ -992,6 +998,49 @@ def pre_permute_standard_to_deep_gemm(
         hidden_states_scale=packed_input_scale,
         use_masked_gemm=False,
         m_indices=m_indices,
+    )
+
+
+@register_pre_permute("flashinfer", "deep_gemm")
+def pre_permute_flashinfer_to_deep_gemm(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    """Feed FlashInfer A2A output into DeepGEMM with expert remapping."""
+
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+    from sglang.srt.runtime_context import get_parallel
+
+    if dispatch_output.hidden_states.dtype != torch.bfloat16:
+        raise TypeError(
+            "FlashInfer A2A + DeepGEMM requires a BF16 dispatch payload, got "
+            f"{dispatch_output.hidden_states.dtype}."
+        )
+    if dispatch_output.hidden_states_scale is not None:
+        raise ValueError(
+            "FlashInfer A2A + DeepGEMM expects unquantized BF16 dispatch; "
+            "hidden_states_scale must be None."
+        )
+    if dispatch_output.topk_output.topk_ids.dtype != torch.int32:
+        raise TypeError(
+            "FlashInfer A2A expert IDs must be int32 before DeepGEMM, got "
+            f"{dispatch_output.topk_output.topk_ids.dtype}."
+        )
+
+    standard_output = StandardDispatchOutput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=None,
+        topk_output=dispatch_output.topk_output,
+    )
+    expert_start = get_parallel().moe_ep_rank * runner_config.num_local_experts
+    return pre_permute_standard_to_deep_gemm(
+        standard_output,
+        quant_info,
+        runner_config,
+        running_state,
+        expert_start=expert_start,
     )
 
 
@@ -1037,6 +1086,30 @@ def post_permute_deep_gemm_to_standard(
     return StandardCombineInput(
         hidden_states=output,
     )
+
+
+@register_post_permute("deep_gemm", "flashinfer")
+def post_permute_deep_gemm_to_flashinfer(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    """Reuse DeepGEMM post-permute and hand BF16 to FlashInfer combine."""
+
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+    )
+
+    standard_input = post_permute_deep_gemm_to_standard(
+        runner_output, quant_info, runner_config, running_state
+    )
+    if standard_input.hidden_states.dtype != torch.bfloat16:
+        raise TypeError(
+            "FlashInfer A2A + DeepGEMM combine payload must be BF16, got "
+            f"{standard_input.hidden_states.dtype}."
+        )
+    return FlashinferCombineInput(hidden_states=standard_input.hidden_states)
 
 
 @register_pre_permute("deepep_ll", "deep_gemm")
