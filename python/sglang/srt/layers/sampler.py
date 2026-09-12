@@ -20,6 +20,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.true_on_policy import resolve_true_on_policy_runtime_policy
 from sglang.srt.utils.async_probe import (
+    maybe_assert_post_replay_hidden_states,
     maybe_assert_post_replay_logits,
     sanitize_nan_logits,
 )
@@ -127,6 +128,10 @@ class Sampler(nn.Module):
 
         if _is_hip and logits.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=logits.device)
+
+        maybe_assert_post_replay_hidden_states(
+            logits_output.hidden_states, "sampler: final_hidden_states"
+        )
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)

@@ -1082,6 +1082,10 @@ class Envs:
     # captured model graph, so it can diagnose graph-replay corruption without
     # materially changing graph capture.
     SGLANG_ASSERT_POST_REPLAY_LOGITS = EnvBool(False)
+    # Diagnostic-only companion to SGLANG_ASSERT_POST_REPLAY_LOGITS. Expose the
+    # already-computed final hidden states as a graph output and check them at
+    # the sampler boundary, without inserting additional model-graph kernels.
+    SGLANG_ASSERT_POST_REPLAY_HIDDEN_STATES = EnvBool(False)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
