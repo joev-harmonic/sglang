@@ -93,6 +93,23 @@ def maybe_assert_post_replay_logits(logits: torch.Tensor, msg: str = "") -> None
     )
 
 
+def maybe_assert_post_replay_hidden_states(
+    hidden_states: Optional[torch.Tensor], msg: str = ""
+) -> None:
+    """Assert that final hidden states are finite after graph replay."""
+    if not envs.SGLANG_ASSERT_POST_REPLAY_HIDDEN_STATES.get():
+        return
+    if hidden_states is None:
+        raise RuntimeError(
+            "SGLANG_ASSERT_POST_REPLAY_HIDDEN_STATES requires final hidden "
+            "states to be exposed by LogitsProcessor"
+        )
+    torch._assert_async(
+        torch.isfinite(hidden_states).all(),
+        f"Non-finite post-replay hidden states detected! {msg}",
+    )
+
+
 def maybe_assert_async(cond: torch.Tensor, msg: str = ""):
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
         return

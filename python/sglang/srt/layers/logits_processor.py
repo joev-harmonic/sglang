@@ -26,6 +26,7 @@ from sglang.kernels.ops.activation.softcap import (
 )
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -395,6 +396,19 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        if (
+            hidden_states_to_store is None
+            and envs.SGLANG_ASSERT_POST_REPLAY_HIDDEN_STATES.get()
+        ):
+            # pruned_states is already the exact final hidden-state input to
+            # the LM head. Returning this alias as a graph output adds no
+            # model-graph computation while making it available for an
+            # assertion after replay.
+            hidden_states_to_store = (
+                pruned_states[sample_indices]
+                if sample_indices is not None
+                else pruned_states
+            )
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
