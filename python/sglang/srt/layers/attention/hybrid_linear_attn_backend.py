@@ -80,6 +80,18 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        """Keep the scheduler's WAR fence until hybrid decode replay finishes.
+
+        Linear-attention decode kernels consume shared recurrent-state metadata
+        throughout the captured model forward, after the generic in-graph
+        metadata marker. Publishing that marker lets the scheduler overwrite
+        the shared buffers while a replay is still reading them.
+        """
+        if fm.is_decode():
+            return SharedReadEnds.POST_REPLAY
+        return super().shared_read_ends(fm)
+
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
         pool). Must run everywhere mamba ids feed the SSM/conv kernels or mamba-pool
