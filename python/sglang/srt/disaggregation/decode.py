@@ -340,6 +340,13 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             ngram_eos_token_id=ngram_eos_token_id,
         )
 
+    def available_prealloc_size(self, running_reqs: List[Req]) -> int:
+        """Apply the decode transfer reservation to the hybrid state pool."""
+        # This class deliberately borrows DecodeReqToTokenPool.__init__ rather
+        # than inheriting from it, so delegate the matching reservation helper
+        # explicitly as well.
+        return DecodeReqToTokenPool.available_prealloc_size(self, running_reqs)
+
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.mamba_allocator.clear()

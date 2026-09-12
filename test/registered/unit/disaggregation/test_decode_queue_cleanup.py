@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeReqToTokenPool,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    HybridMambaDecodeReqToTokenPool,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -65,6 +66,18 @@ class TestDecodeQueueCleanup(CustomTestCase):
         pool.free_slots = list(range(100))
 
         self.assertEqual(pool.available_prealloc_size([]), 100)
+
+    def test_hybrid_pool_uses_transfer_reservation(self):
+        pool = HybridMambaDecodeReqToTokenPool.__new__(
+            HybridMambaDecodeReqToTokenPool
+        )
+        pool.size = 210
+        pool.pre_alloc_size = 64
+        pool._alloc_size = 275
+        pool.free_slots = list(range(14))
+        running_reqs = [SimpleNamespace(req_pool_idx=i) for i in range(200)]
+
+        self.assertEqual(pool.available_prealloc_size(running_reqs), 4)
 
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
