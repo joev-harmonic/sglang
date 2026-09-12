@@ -76,6 +76,23 @@ def sanitize_nan_logits(logits: torch.Tensor, msg: str = ""):
     torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
 
 
+def maybe_assert_post_replay_logits(logits: torch.Tensor, msg: str = "") -> None:
+    """Assert that sampler-boundary logits are finite, outside graph capture.
+
+    This is deliberately gated separately from the broad async-assert switch:
+    enabling every model-internal probe changes the captured CUDA graph enough
+    to mask some timing-sensitive failures. The sampler runs after graph replay,
+    so this check preserves the captured model graph while identifying whether
+    corruption is already present at its output.
+    """
+    if not envs.SGLANG_ASSERT_POST_REPLAY_LOGITS.get():
+        return
+    torch._assert_async(
+        torch.isfinite(logits).all(),
+        f"Non-finite post-replay logits detected! {msg}",
+    )
+
+
 def maybe_assert_async(cond: torch.Tensor, msg: str = ""):
     if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
         return

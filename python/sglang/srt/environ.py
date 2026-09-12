@@ -1082,6 +1082,11 @@ class Envs:
     # Logits and log-probability processing
     # ===================================================================
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    # Diagnostic-only check for non-finite logits at the sampler boundary.
+    # Unlike SGLANG_ENABLE_ASYNC_ASSERT, this does not add probes inside the
+    # captured model graph, so it can diagnose graph-replay corruption without
+    # materially changing graph capture.
+    SGLANG_ASSERT_POST_REPLAY_LOGITS = EnvBool(False)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
