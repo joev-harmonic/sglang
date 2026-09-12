@@ -951,6 +951,20 @@ class QwenSparseAttnBackend(AttentionBackend):
         ]
         self._extend_lens_pin_idx = 0
 
+    def init_full_prefill_cuda_graph_state(
+        self, max_bs: int, max_num_tokens: int
+    ) -> None:
+        """Allocate the request-axis QSA metadata used by Full prefill graphs.
+
+        Non-speculative prefill has one metadata row per request, not per input
+        token.  Keeping this allocation request-sized avoids a large, unused
+        compressed-page table while still giving FullCG stable tensor addresses.
+        The metadata objects captured below retain these buffers when decode
+        subsequently initializes its independent CUDA-graph state.
+        """
+        del max_num_tokens
+        self.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_bs)
+
     def _require_compressed_cuda_graph_support(self) -> None:
         if (
             self.qsa_profile is not None
