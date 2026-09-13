@@ -11,7 +11,6 @@ Requires flashinfer >= 0.6.14.
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -112,8 +111,6 @@ def _get_flashinfer_gdn_kernels():
     global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_mtp_bf16
     if _flashinfer_gdn_available is None:
         try:
-            os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
-
             from flashinfer.gdn_decode import (
                 gated_delta_rule_decode_pretranspose,
                 gated_delta_rule_mtp,
