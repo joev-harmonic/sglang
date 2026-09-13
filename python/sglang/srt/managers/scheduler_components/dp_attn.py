@@ -271,14 +271,18 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
-    breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+    prefill_graph_enabled = check_cuda_graph_backend(
+        Phase.PREFILL, Backend.BREAKABLE
+    ) or check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
     prefill_graph_runner = (
-        model_runner.prefill_cuda_graph_runner if breakable_prefill else None
+        model_runner.prefill_cuda_graph_runner if prefill_graph_enabled else None
     )
     can_run_prefill_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_idle()
-        # Breakable Cuda Graph Backend Check.
+        # Prefill CUDA graph backend check. FULL graphs need the same
+        # cross-DP eligibility vote as BREAKABLE graphs; otherwise the
+        # forward-time runner rejects every FULL replay under DP attention.
         or (
             local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and (
@@ -295,7 +299,7 @@ def prepare_mlp_sync_batch_raw(
                     lora_ineligible=prefill_graph_runner.enable_lora,
                 )
             )
-            and breakable_prefill
+            and prefill_graph_enabled
         )
     )
 
