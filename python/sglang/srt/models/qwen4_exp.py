@@ -1186,6 +1186,13 @@ class Qwen4ExpPLELayer(nn.Module):
             ngram_eos_token_id=self.ple_embedding.eos_token_id,
         )
         if batch is None:
+            # DP-attention converts idle ranks into graph-shaped EXTEND
+            # participants.  They must still issue the PLE gather/scatter
+            # collectives in the same order as active ranks; skipping them
+            # here cross-wires the next collective (and eventually trips an
+            # all_gather size mismatch).  The result is intentionally ignored
+            # because the rank has no semantic tokens.
+            self.ple_embedding.forward_idle(forward_batch)
             output.zero_()
             return
 
