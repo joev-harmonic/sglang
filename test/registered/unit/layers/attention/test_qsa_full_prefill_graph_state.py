@@ -12,7 +12,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestQSAFullPrefillGraphState(unittest.TestCase):
-    def test_uses_request_axis_and_survives_decode_initialization(self):
+    def test_uses_phase_private_metadata_and_survives_decode_initialization(self):
         backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
         backend.device = torch.device("cpu")
         backend.max_context_len = 4096
@@ -22,18 +22,12 @@ class TestQSAFullPrefillGraphState(unittest.TestCase):
         backend.init_full_prefill_cuda_graph_state(
             max_bs=8, max_num_tokens=16_384
         )
-        prefill_seq_lens = backend._graph_seq_lens
-        prefill_page_table = backend._graph_compressed_page_table
-
-        self.assertEqual(prefill_seq_lens.shape, (8,))
-        self.assertEqual(prefill_page_table.shape, (8, 16))
+        self.assertEqual(backend._full_prefill_cuda_graph_metadata, {})
 
         backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2)
 
         self.assertEqual(backend._graph_seq_lens.shape, (2,))
-        self.assertNotEqual(backend._graph_seq_lens.data_ptr(), prefill_seq_lens.data_ptr())
-        self.assertEqual(prefill_seq_lens.shape, (8,))
-        self.assertEqual(prefill_page_table.shape, (8, 16))
+        self.assertEqual(backend._full_prefill_cuda_graph_metadata, {})
 
 
 if __name__ == "__main__":

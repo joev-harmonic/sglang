@@ -202,6 +202,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
         ] = {}
+        self._full_prefill_cuda_graph_metadata: Dict[int, QwenSparseAttnMetadata] = {}
         self._cuda_graph_max_tokens = 0
         self._fa2_scratch: Dict[
             Tuple[int, int, torch.dtype, torch.device],
@@ -857,6 +858,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_batch,
         in_capture: bool = False,
     ):
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            num_tokens = int(forward_batch.input_ids.shape[0])
+            if in_capture:
+                self._capture_full_prefill_cuda_graph_metadata(
+                    forward_batch, num_tokens
+                )
+            else:
+                self._replay_full_prefill_cuda_graph_metadata(forward_batch, num_tokens)
+            return
         if in_capture:
             num_tokens = (
                 forward_batch.input_ids.shape[0]
@@ -962,8 +972,148 @@ class QwenSparseAttnBackend(AttentionBackend):
         The metadata objects captured below retain these buffers when decode
         subsequently initializes its independent CUDA-graph state.
         """
-        del max_num_tokens
-        self.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_bs)
+        del max_bs, max_num_tokens
+        self._full_prefill_cuda_graph_metadata = {}
+
+    def _capture_full_prefill_cuda_graph_metadata(
+        self, forward_batch, num_tokens: int
+    ) -> None:
+        """Build pointer-stable QSA metadata for one FullCG token bucket.
+
+        Full prefill graphs are token-bucketed but keep a fixed request axis.
+        QSA additionally needs token-axis row maps and a request/context token
+        table, neither of which is represented by the decode graph metadata.
+        Keep those tensors alive per bucket and refresh them in place at replay.
+        """
+        metadata = self._metadata_from_forward_batch(forward_batch)
+        indexer = metadata.indexer_metadata
+
+        token_slot_table = torch.zeros(
+            (forward_batch.batch_size, self.max_context_len),
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
+        token_slot_table[:, : indexer.token_slot_table.shape[1]].copy_(
+            indexer.token_slot_table
+        )
+
+        # Always capture the compressed-selection topology. The all-visible
+        # shortcut is host-selected from sequence lengths and cannot be shared
+        # by the cached-prefix variants of the same graph bucket.
+        row_starts, row_ends, compressed_cu_seqlens = build_qsa_row_ranges(
+            metadata.sequence_lengths,
+            forward_batch.positions.flatten()[: metadata.token_to_batch_idx.numel()],
+            metadata.token_to_batch_idx,
+            self.compress_ratio,
+        )
+        pool = self.token_to_kv_pool
+        compressed_scratch = self._get_qsa_prefill_compressed_scratch(
+            num_tokens // self.compress_ratio,
+            pool.qsa_index_kv_heads,
+            pool.qsa_index_head_dim,
+            pool.qsa_compressed_flat.dtype,
+            pool.qsa_compressed_flat.device,
+        )
+        indexer = msgspec.structs.replace(
+            indexer,
+            token_slot_table=token_slot_table,
+            prefill_compressed_cu_seqlens=compressed_cu_seqlens,
+            prefill_row_starts=row_starts,
+            prefill_row_ends=row_ends,
+            prefill_compressed_scratch=compressed_scratch,
+            prefill_all_visible=False,
+            prefill_all_visible_scratch=None,
+        )
+        metadata = msgspec.structs.replace(
+            metadata,
+            token_slot_table=token_slot_table,
+            indexer_metadata=indexer,
+        )
+        self._full_prefill_cuda_graph_metadata[num_tokens] = metadata
+        self.forward_metadata = metadata
+
+    @staticmethod
+    def _copy_full_prefill_field(
+        name: str,
+        destination: Optional[torch.Tensor],
+        source: Optional[torch.Tensor],
+    ) -> None:
+        if destination is None or source is None:
+            if destination is source:
+                return
+            raise RuntimeError(
+                f"QSA FullCG metadata field {name} changed topology at replay"
+            )
+        if destination.shape != source.shape:
+            raise RuntimeError(
+                f"QSA FullCG metadata field {name} changed shape: "
+                f"captured={tuple(destination.shape)}, replay={tuple(source.shape)}"
+            )
+        destination.copy_(source)
+
+    def _replay_full_prefill_cuda_graph_metadata(
+        self, forward_batch, num_tokens: int
+    ) -> None:
+        metadata = self._full_prefill_cuda_graph_metadata.get(num_tokens)
+        if metadata is None:
+            raise RuntimeError(
+                f"QSA FullCG has no exact prefill token bucket for {num_tokens} tokens"
+            )
+        fresh = self._metadata_from_forward_batch(forward_batch)
+        src = fresh.indexer_metadata
+        dst = metadata.indexer_metadata
+
+        self._copy_full_prefill_field(
+            "sequence_lengths", metadata.sequence_lengths, fresh.sequence_lengths
+        )
+        self._copy_full_prefill_field(
+            "token_to_batch_idx",
+            metadata.token_to_batch_idx,
+            fresh.token_to_batch_idx,
+        )
+        self._copy_full_prefill_field(
+            "row_req_pool_indices",
+            metadata.row_req_pool_indices,
+            fresh.row_req_pool_indices,
+        )
+        if src.token_slot_table.shape[1] > dst.token_slot_table.shape[1]:
+            raise RuntimeError(
+                "QSA FullCG replay context exceeds the captured token table: "
+                f"replay={src.token_slot_table.shape[1]}, "
+                f"captured={dst.token_slot_table.shape[1]}"
+            )
+        dst.token_slot_table[:, : src.token_slot_table.shape[1]].copy_(
+            src.token_slot_table
+        )
+
+        for name in (
+            "write_locs",
+            "compress_group_positions",
+            "compress_sequence_ids",
+            "compress_member_rows",
+            "pending_ring_slots",
+            "extend_rope_matrix",
+        ):
+            self._copy_full_prefill_field(name, getattr(dst, name), getattr(src, name))
+
+        row_starts, row_ends, compressed_cu_seqlens = build_qsa_row_ranges(
+            fresh.sequence_lengths,
+            forward_batch.positions.flatten()[: fresh.token_to_batch_idx.numel()],
+            fresh.token_to_batch_idx,
+            self.compress_ratio,
+        )
+        self._copy_full_prefill_field(
+            "prefill_compressed_cu_seqlens",
+            dst.prefill_compressed_cu_seqlens,
+            compressed_cu_seqlens,
+        )
+        self._copy_full_prefill_field(
+            "prefill_row_starts", dst.prefill_row_starts, row_starts
+        )
+        self._copy_full_prefill_field(
+            "prefill_row_ends", dst.prefill_row_ends, row_ends
+        )
+        self.forward_metadata = metadata
 
     def _require_compressed_cuda_graph_support(self) -> None:
         if (

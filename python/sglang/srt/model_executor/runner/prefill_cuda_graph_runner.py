@@ -52,6 +52,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
 )
@@ -376,6 +377,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ) from e
 
         self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        self._full_graph_requires_exact_tokens = self._is_full_backend and is_qwen_qsa(
+            self.model_runner.model_config.hf_config
+        )
         self.stage_full_cuda_graph_outputs = self._is_full_backend
         if self._is_full_backend:
             max_req = prefill_config.full_prefill_max_req
@@ -1102,6 +1106,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if num_tokens is None:
             return True
         if num_tokens > self.max_num_tokens:
+            return False
+        # QSA's full-prefill graph metadata is token-axis and is captured per
+        # exact bucket. Smaller tail chunks stay eager; decode retains its own
+        # normal batch-size graph padding.
+        if (
+            self._full_graph_requires_exact_tokens
+            and num_tokens not in self.capture_num_tokens
+        ):
             return False
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
