@@ -1091,6 +1091,9 @@ class Envs:
     # already-computed final hidden states as a graph output and check them at
     # the sampler boundary, without inserting additional model-graph kernels.
     SGLANG_ASSERT_POST_REPLAY_HIDDEN_STATES = EnvBool(False)
+    # Diagnostic-only synchronous checks around each eager linear-attention
+    # boundary in a breakable prefill graph.
+    SGLANG_ASSERT_BCG_LINEAR_BOUNDARIES = EnvBool(False)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)

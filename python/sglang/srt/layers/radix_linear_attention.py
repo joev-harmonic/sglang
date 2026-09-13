@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -139,6 +140,13 @@ def unified_linear_attention_with_output(
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
+    if envs.SGLANG_ASSERT_BCG_LINEAR_BOUNDARIES.get():
+        for name, tensor in (("mixed_qkv", mixed_qkv), ("a", a), ("b", b)):
+            if not torch.isfinite(tensor[:real_num_tokens]).all().item():
+                raise RuntimeError(
+                    f"Non-finite BCG linear-attention input {name} at layer {layer_id}"
+                )
+
     original_out_cache_loc = forward_batch.out_cache_loc
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
@@ -151,6 +159,13 @@ def unified_linear_attention_with_output(
         a=a[:real_num_tokens],
         b=b[:real_num_tokens],
     )
+    if (
+        envs.SGLANG_ASSERT_BCG_LINEAR_BOUNDARIES.get()
+        and not torch.isfinite(ret).all().item()
+    ):
+        raise RuntimeError(
+            f"Non-finite BCG linear-attention output at layer {layer_id}"
+        )
     forward_batch.out_cache_loc = original_out_cache_loc
 
     output[:, :real_num_tokens].copy_(ret)
