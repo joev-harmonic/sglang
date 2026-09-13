@@ -31,6 +31,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
+    get_local_dp_buffer_len,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
@@ -574,7 +575,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if not self.gather_dp_tokens:
             return ngram_ids, semantic_tokens
 
-        padded_ngram_ids = _pad_token_rows(ngram_ids, physical_tokens)
+        # Breakable prefill graphs pad the model input to the capture bucket,
+        # while MAX_LEN DP collectives retain the smaller live per-rank stride.
+        # PLE is an eager graph break, so its all-gather input must use that
+        # live stride rather than the graph-shaped ``physical_tokens``.  The
+        # output is scattered into the graph-sized buffer below.
+        local_gather_tokens = get_local_dp_buffer_len()
+        padded_ngram_ids = _pad_token_rows(ngram_ids, local_gather_tokens)
         global_tokens = forward_batch.global_dp_buffer_len
         if global_tokens is None:
             raise RuntimeError(
@@ -683,7 +690,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if not self.gather_dp_tokens:
             return
         input_ids = forward_batch.input_ids.reshape(-1)
-        dummy_ids = input_ids.new_zeros((input_ids.shape[0], self.ngram_heads))
+        # The rank has no semantic PLE rows, but it must contribute the live
+        # MAX_LEN-padded collective payload. _prepare_embedding_lookup pads
+        # this empty tensor to that live DP stride.
+        dummy_ids = input_ids.new_empty((0, self.ngram_heads))
         self._embed_ngram_ids(dummy_ids, forward_batch, input_ids.shape[0])
 
     def forward(
