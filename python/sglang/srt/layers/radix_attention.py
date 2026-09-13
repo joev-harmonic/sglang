@@ -356,7 +356,41 @@ def _unified_attention_with_output_impl(
     if llama_4_scaling is not None:
         kwargs["llama_4_scaling"] = llama_4_scaling
     if topk_indices is not None:
-        kwargs["topk_indices"] = topk_indices[:real_query_num_tokens]
+        topk_indices = topk_indices[:real_query_num_tokens]
+        if envs.SGLANG_ASSERT_BCG_LINEAR_BOUNDARIES.get():
+            if topk_indices.ndim != 2:
+                raise RuntimeError(
+                    "Unexpected BCG QSA top-k rank at layer "
+                    f"{layer_id}: shape={tuple(topk_indices.shape)}"
+                )
+            valid = topk_indices >= 0
+            empty_rows = ~valid.any(dim=1)
+            if empty_rows.any().item():
+                row = int(torch.nonzero(empty_rows, as_tuple=False)[0, 0].item())
+                raise RuntimeError(
+                    f"Empty BCG QSA top-k row at layer {layer_id}: row={row}"
+                )
+
+            positions = forward_batch.positions
+            if positions is not None:
+                # Qwen MRoPE carries three axes; its first axis is the text-token
+                # coordinate used to enforce the causal sparse-attention window.
+                logical_positions = (
+                    positions[0] if positions.ndim == 2 else positions
+                ).flatten()[: topk_indices.shape[0]]
+                future = valid & (
+                    topk_indices.to(torch.int64)
+                    >= logical_positions.to(torch.int64).unsqueeze(1) + 1
+                )
+                if future.any().item():
+                    row, column = torch.nonzero(future, as_tuple=False)[0].tolist()
+                    raise RuntimeError(
+                        "Future/out-of-range BCG QSA top-k index at layer "
+                        f"{layer_id}: row={row}, column={column}, "
+                        f"index={int(topk_indices[row, column].item())}, "
+                        f"position={int(logical_positions[row].item())}"
+                    )
+        kwargs["topk_indices"] = topk_indices
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_positions = forward_batch.positions
