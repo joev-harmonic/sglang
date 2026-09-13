@@ -52,6 +52,13 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -944,6 +951,15 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
+        self._is_last_ple_layer = (
+            ple_layer_index == len(set(config.ple_layer_ids)) - 1
+        )
+        # PLE consumes per-request row/checkpoint metadata that is not part of
+        # BCG's token-count-only shape key. Re-read that metadata from the live
+        # replay context instead of baking the bs=1 capture batch into the graph.
+        self._breakable_forward = eager_on_graph(True)(
+            self._breakable_forward_impl
+        )
 
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
         y = norm(x.flatten(-2, -1))
@@ -1154,6 +1170,40 @@ class Qwen4ExpPLELayer(nn.Module):
         self._prefetch_state = None
         return embeddings
 
+    def _breakable_forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        context = get_tc_piecewise_forward_context()
+        if context is None or context.forward_batch is None:
+            raise RuntimeError("Qwen4 PLE graph break is missing its forward context")
+        forward_batch = context.forward_batch
+        batch = _prepare_ple_batch(
+            forward_batch.input_ids,
+            forward_batch,
+            ngram_size=self.ple_embedding.ngram_size,
+            ngram_eos_token_id=self.ple_embedding.eos_token_id,
+        )
+        if batch is None:
+            output.zero_()
+            return
+
+        ple_output = self(hidden_states, forward_batch, batch)
+        output.copy_(ple_output)
+        # Every PLE layer consumes the same incoming N-gram context. The final
+        # one advances it only after its own stateful work has completed.
+        if self._is_last_ple_layer:
+            _commit_ple_batch(batch, forward_batch)
+
+    def forward_breakable(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        output = torch.empty_like(hidden_states)
+        self._breakable_forward(hidden_states, output)
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1284,7 +1334,15 @@ class Qwen4ExpLayerExtensionMixin:
             )
 
         if self.ple is not None:
-            if ple_batch is None:
+            if (
+                is_in_breakable_cuda_graph()
+                and get_tc_piecewise_forward_context() is not None
+            ):
+                ple_query = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                hidden_states = hidden_states + self.ple.forward_breakable(ple_query)
+            elif ple_batch is None:
                 if not _get_ple_forward_mode(forward_batch).is_idle():
                     raise RuntimeError(
                         "non-idle Qwen4 PLE forward is missing its batch"
@@ -1619,6 +1677,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        breakable_ple = (
+            self.has_ple
+            and is_in_breakable_cuda_graph()
+            and get_tc_piecewise_forward_context() is not None
+        )
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
@@ -1631,7 +1694,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
-            if self.has_ple
+            if self.has_ple and not breakable_ple
             else None
         )
         residual = None
@@ -1640,7 +1703,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
                 next_ple = getattr(self.layers[i + 1], "ple", None)
-                if next_ple is not None:
+                if next_ple is not None and not breakable_ple:
                     next_ple.start_prefetch(ple_batch, forward_batch)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
@@ -1656,7 +1719,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     ),
                 )
 
-        _commit_ple_batch(ple_batch, forward_batch)
+        if not breakable_ple:
+            _commit_ple_batch(ple_batch, forward_batch)
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
