@@ -1123,12 +1123,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        # FullCG captures the no-checkpoint EXTEND topology. Saving a Mamba
-        # radix checkpoint adds data-dependent gather/scatter work, so those
-        # infrequent boundary batches must use the eager path.
+        # Prefill graphs capture the no-checkpoint EXTEND topology. Saving a
+        # Mamba radix checkpoint adds data-dependent gather/scatter work, so
+        # those boundary batches must use the eager path. Breakable attention
+        # runs eagerly, but Qwen PLE's matching side-state snapshot remains in
+        # a captured segment and must make the same replay decision.
         if (
-            self._is_full_backend
-            and getattr(forward_batch, "mamba_track_mask", None) is not None
+            getattr(forward_batch, "mamba_track_mask", None) is not None
             and bool(forward_batch.mamba_track_mask.any())
         ):
             return False

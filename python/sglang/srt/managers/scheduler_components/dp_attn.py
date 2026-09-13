@@ -285,6 +285,13 @@ def prepare_mlp_sync_batch_raw(
         # forward-time runner rejects every FULL replay under DP attention.
         or (
             local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            # A Mamba radix checkpoint changes the prefill topology. Include
+            # it in the cross-DP vote so every rank takes the eager path when
+            # any rank needs to snapshot recurrent/PLE side state.
+            and not (
+                local_batch.mamba_track_mask is not None
+                and bool(local_batch.mamba_track_mask.any())
+            )
             and (
                 prefill_graph_runner is None
                 or prefill_graph_runner.can_replay_locally(
