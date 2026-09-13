@@ -1538,6 +1538,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_ids=input_ids,
             input_embeds=input_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
+            # Breakable capture leaves QSA's chunked-prefix gather eager. Keep
+            # the scheduler-owned host mirror available to that segment so it
+            # does not fall back to a per-layer device-to-host copy.
+            req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
             seq_lens=forward_batch.seq_lens,
             next_token_logits_buffer=self._next_token_logits_buffer(
                 self._prefill_logits_buffer_rows(forward_batch)
