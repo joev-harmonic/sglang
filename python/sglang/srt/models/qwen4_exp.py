@@ -45,6 +45,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scat
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.radix_attention import force_eager_attention
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -74,6 +75,45 @@ from sglang.srt.utils import logger
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+def _qsa_attention_with_live_metadata(
+    layer,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor:
+    """Run QSA selection and attention together at a BCG break.
+
+    QSA's prefill indexer consumes request-dependent row windows and compressed
+    cache metadata. Those tensors are rebuilt for every request and therefore
+    cannot be read by a graph segment captured against the dummy prefill batch.
+    Resolve the live batch from the replay context and keep both the indexer and
+    its sparse-attention consumer in the same eager break.
+    """
+
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    topk_indices = layer._compute_qsa_topk_indices(
+        hidden_states, positions, forward_batch
+    )
+    # This function already is the BCG break. Prevent RadixAttention from
+    # attempting to split the ended graph segment a second time.
+    with force_eager_attention():
+        return layer.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            topk_indices=topk_indices,
+        )
+
+
+breakable_qsa_attention_with_live_metadata = eager_on_graph(True)(
+    _qsa_attention_with_live_metadata
+)
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -1567,10 +1607,12 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        use_breakable_qsa = self.is_qsa and is_in_breakable_cuda_graph()
         overlap_indexer = (
             self.is_qsa
             and self.alt_stream is not None
             and get_is_capture_mode()
+            and not use_breakable_qsa
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
         )
         attention_kwargs = {}
@@ -1590,7 +1632,16 @@ class Qwen4ExpAttentionDecoderLayer(
             forward_batch=forward_batch,
         )
 
-        if overlap_indexer:
+        if use_breakable_qsa:
+            attn_output = breakable_qsa_attention_with_live_metadata(
+                self,
+                positions,
+                hidden_states,
+                q,
+                k,
+                v,
+            )
+        elif overlap_indexer:
             current_stream.wait_stream(self.alt_stream)
             # Allocated on alt_stream, consumed by attention on the current
             # stream; tell the caching allocator before alt_stream is reused.
@@ -1601,7 +1652,8 @@ class Qwen4ExpAttentionDecoderLayer(
                 hidden_states, positions, forward_batch
             )
 
-        attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
+        if not use_breakable_qsa:
+            attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         if gate is not None:
             if attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the
