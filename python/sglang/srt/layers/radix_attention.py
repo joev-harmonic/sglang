@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -325,6 +326,13 @@ def _unified_attention_with_output_impl(
     if value is not None:
         value = value[:key_value_num_tokens]
 
+    if envs.SGLANG_ASSERT_BCG_LINEAR_BOUNDARIES.get():
+        for name, tensor in (("query", query), ("key", key), ("value", value)):
+            if tensor is not None and not torch.isfinite(tensor).all().item():
+                raise RuntimeError(
+                    f"Non-finite BCG full-attention input {name} at layer {layer_id}"
+                )
+
     # DeepSeek MLA has two RadixAttention instances per layer (attn_mqa and
     # attn_mha) that share the same layer_id. Preserve the calling instance's
     # identity through the custom-op boundary; save_kv_cache is not an identity
@@ -384,6 +392,14 @@ def _unified_attention_with_output_impl(
 
     if ret.data_ptr() != output.data_ptr():
         output[:real_query_num_tokens].view(ret.shape).copy_(ret)
+
+    if (
+        envs.SGLANG_ASSERT_BCG_LINEAR_BOUNDARIES.get()
+        and not torch.isfinite(ret).all().item()
+    ):
+        raise RuntimeError(
+            f"Non-finite BCG full-attention output at layer {layer_id}"
+        )
 
     # During PCG replay the attention backend writes only the narrowed
     # real-token slice (output[:real_query_num_tokens]) and leaves padded positions
