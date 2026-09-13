@@ -83,7 +83,7 @@ def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
     scale = head_dim**-0.5
 
     actual = sparse_gqa_fwd_interface_triton_ck(
-        q, k, v, indices, cu_q, cu_k, kv_lens, scale
+        q, k, v, indices, cu_q, cu_k, kv_lens, scale, max_q=1
     )
     expected = sparse_gqa_fwd_interface_triton_ck(
         q,
@@ -94,6 +94,7 @@ def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
         cu_k,
         kv_lens,
         scale,
+        max_q=1,
     )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 

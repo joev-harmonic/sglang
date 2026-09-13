@@ -13,6 +13,9 @@ from sglang.srt.layers.attention.qsa.kernel import (
 )
 from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+from sglang.srt.layers.attention.qsa.sparse_attn import (
+    sparse_gqa_fwd_interface_triton_ck,
+)
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
 )
@@ -45,6 +48,15 @@ def test_qsa_prefill_hot_paths_have_no_explicit_host_materialization():
         ), function.__qualname__
     for function in (QSAIndexer.project_qk, QSAIndexer.apply_rope):
         assert not _forbidden_calls(function, {"max"}), function.__qualname__
+
+
+def test_qsa_chunk_prefill_reuses_host_metadata():
+    source = inspect.getsource(QwenSparseAttnBackend.forward_extend)
+    assert "forward_batch.req_pool_indices.tolist()" not in source
+    assert "forward_batch.req_pool_indices_cpu" in source
+
+    source = inspect.getsource(sparse_gqa_fwd_interface_triton_ck)
+    assert ".item()" not in source
 
 
 def test_qsa_prefill_pack_has_no_eager_gather_chain():

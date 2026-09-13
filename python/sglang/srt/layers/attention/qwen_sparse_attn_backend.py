@@ -1484,7 +1484,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
+        req_pool_indices_cpu = forward_batch.req_pool_indices_cpu
+        if req_pool_indices_cpu is None:
+            raise RuntimeError("QSA chunked prefill requires host request indices")
+        req_indices = req_pool_indices_cpu.tolist()
         k_parts = [
             k_buffer.index_select(
                 0, req_to_token[req_indices[i], : sequence_lens[i]].long()
@@ -1497,8 +1500,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             for i in range(len(sequence_lens))
         ]
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
+        sequence_lens_tensor = forward_batch.seq_lens[: len(sequence_lens)].to(
+            device=q.device, dtype=torch.int32
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         output = sparse_gqa_fwd_interface_triton_ck(
@@ -1510,6 +1513,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            max_q=max(extend_lens, default=1),
         )
         return self._pad_extend_output(output, num_output_rows)
 

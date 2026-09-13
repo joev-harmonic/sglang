@@ -443,6 +443,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
+
+    # Host mirror of ``req_pool_indices``.  Some eager prefill paths need the
+    # request rows for Python-side slicing; carrying the scheduler-owned CPU
+    # tensor avoids a device-to-host synchronization inside every model layer.
+    req_pool_indices_cpu: Optional[torch.Tensor] = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
     # Whether to return pooled hidden states (pre-head transformer output)
@@ -772,6 +777,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
@@ -1747,6 +1753,7 @@ def build_inner_fb_view(
         input_ids=getattr(forward_batch, "input_ids", None),
         positions=getattr(forward_batch, "positions", None),
         req_pool_indices=forward_batch.req_pool_indices,
+        req_pool_indices_cpu=getattr(forward_batch, "req_pool_indices_cpu", None),
         seq_lens=forward_batch.seq_lens,
         seq_lens_sum=forward_batch.seq_lens_sum,
         seq_lens_cpu=forward_batch.seq_lens_cpu,
