@@ -146,6 +146,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
+        self.disable_chunked_radix_insert = params.disable_chunked_radix_insert
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -766,7 +767,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         token_ids = req.get_fill_ids()
 
-        if self.disable:
+        # Keep in-flight chunk pages request-owned until completion. Publishing
+        # them here lets a retract free pages still referenced by the tree.
+        if self.disable or (self.disable_chunked_radix_insert and chunked):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(token_ids)
             ]

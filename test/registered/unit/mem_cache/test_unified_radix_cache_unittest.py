@@ -1137,6 +1137,44 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
+    def test_disable_chunked_radix_insert_defers_publication(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cache.disable_chunked_radix_insert = True
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 3)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+        req.kv_committed_len = len(tokens)
+        req.last_node = cache.root_node.id
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        if self.cfg.has_mamba:
+            req.mamba_last_track_seqlen = len(tokens)
+
+        cache.cache_unfinished_req(req, chunked=True)
+
+        self.assertTrue(torch.equal(req.prefix_indices, kv_indices.to(torch.int64)))
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertEqual(req.last_node, cache.root_node.id)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(match.device_indices), 0)
+
+        cache.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(
+            len(match.device_indices),
+            len(tokens) // self.cfg.page_size * self.cfg.page_size,
+        )
+        cache.sanity_check()
+
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")
